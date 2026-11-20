@@ -14,6 +14,7 @@ pub(crate) enum Event {
     Stage(&'static str),
     CreateSurface { instance: wgpu::Instance, reply: mpsc::Sender<SurfaceResult> },
     Finished(Result<Box<Renderer>, String>),
+    UpdateChecked(Result<crate::about::BuildStatus, crate::about::CheckError>),
 }
 
 pub(crate) fn create_surface(window: Arc<Window>, instance: wgpu::Instance, reply: mpsc::Sender<SurfaceResult>) {
@@ -174,6 +175,7 @@ mod tests {
             fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
                 match event {
                     Event::Stage(stage) => self.startup.set_stage(stage),
+                    Event::UpdateChecked(_) => unreachable!("The startup test does not check for updates"),
                     Event::CreateSurface { instance, reply } => create_surface(self.window.as_ref().unwrap().clone(), instance, reply),
                     Event::Finished(result) => {
                         self.result = Some(result.and_then(|mut renderer| {

@@ -1,3 +1,4 @@
+mod about;
 mod export;
 mod camera_effects;
 mod history;
@@ -961,7 +962,7 @@ impl ControlsTab {
         response.on_hover_text(self.label())
     }
 }
-struct App { startup: startup::Startup, event_proxy: Option<winit::event_loop::EventLoopProxy<startup::Event>>, window: Option<Arc<Window>>, renderer: Option<Renderer>, camera: Camera, keys: HashSet<KeyCode>, looking: bool, last_frame: Instant, slice: Option<f32>, power: f32, fractal: Fractal, mutation: MutationStage, extra_mutations: Vec<MutationStage>, base_weight: f32, menger_parameters: MengerParameters, mandelbox_parameters: MandelboxParameters, mandelbulb_parameters: MandelbulbParameters, fold_parameters: FoldParameters, diagnostic: bool, material: u32, matcap_rotation: f32, ao: bool, ao_strength: f32, ao_radius: f32, exposure: f32, contrast: f32, normal_smoothing: f32, quality: f32, antialias: bool, distant_filter: f32, lighting: Lighting, refine_idle: bool, refine_target: u32, progress_samples: u32, progress_tile: u32, motion_samples: u32, motion_recovery: u32, idle_deadline: Option<Instant>, idle_ready: bool, last_scene: Vec<f32>, egui_ctx: egui::Context, egui_state: Option<egui_winit::State>, preset_status: String, presets: preset_gallery::Gallery, capture_slot: Option<u64>, output: OutputSettings, render_job: Option<RenderJob>, start_export: bool, left_open: bool, controls_tab: ControlsTab, right_open: bool, effects: CameraEffects, background_color: [f32; 3], show_frame: bool, frame: Option<egui::Rect>, picking_focus: bool, focus_point: Option<[f32; 2]>, focus_status: String, history: history::History, history_actions: Vec<history::Action>, modifiers: winit::keyboard::ModifiersState }
+struct App { about: about::About, startup: startup::Startup, event_proxy: Option<winit::event_loop::EventLoopProxy<startup::Event>>, window: Option<Arc<Window>>, renderer: Option<Renderer>, camera: Camera, keys: HashSet<KeyCode>, looking: bool, last_frame: Instant, slice: Option<f32>, power: f32, fractal: Fractal, mutation: MutationStage, extra_mutations: Vec<MutationStage>, base_weight: f32, menger_parameters: MengerParameters, mandelbox_parameters: MandelboxParameters, mandelbulb_parameters: MandelbulbParameters, fold_parameters: FoldParameters, diagnostic: bool, material: u32, matcap_rotation: f32, ao: bool, ao_strength: f32, ao_radius: f32, exposure: f32, contrast: f32, normal_smoothing: f32, quality: f32, antialias: bool, distant_filter: f32, lighting: Lighting, refine_idle: bool, refine_target: u32, progress_samples: u32, progress_tile: u32, motion_samples: u32, motion_recovery: u32, idle_deadline: Option<Instant>, idle_ready: bool, last_scene: Vec<f32>, egui_ctx: egui::Context, egui_state: Option<egui_winit::State>, preset_status: String, presets: preset_gallery::Gallery, capture_slot: Option<u64>, output: OutputSettings, render_job: Option<RenderJob>, start_export: bool, left_open: bool, controls_tab: ControlsTab, right_open: bool, effects: CameraEffects, background_color: [f32; 3], show_frame: bool, frame: Option<egui::Rect>, picking_focus: bool, focus_point: Option<[f32; 2]>, focus_status: String, history: history::History, history_actions: Vec<history::Action>, modifiers: winit::keyboard::ModifiersState }
 impl Default for App {
     fn default() -> Self {
         // Equal offsets from the three axes give the Menger cube the icon's diagonal view.
@@ -972,7 +973,7 @@ impl Default for App {
             ..Camera::default()
         };
         let effects = CameraEffects { focal: 60.0, ..CameraEffects::default() };
-        Self { startup: startup::Startup::default(), event_proxy: None, window: None, renderer: None, camera, keys: HashSet::new(), looking: false, last_frame: Instant::now(), slice: None, power: 8.0, fractal: Fractal::default(), mutation: MutationStage::default(), extra_mutations: Vec::new(), base_weight: 1.0, menger_parameters: MengerParameters::default(), mandelbox_parameters: MandelboxParameters::default(), mandelbulb_parameters: MandelbulbParameters::default(), fold_parameters: FoldParameters::default(), diagnostic: false, material: 0, matcap_rotation: 0.0, ao: false, ao_strength: 0.5, ao_radius: 0.048, exposure: 0.0, contrast: 1.0, normal_smoothing: 0.002, quality: 1.0, antialias: false, distant_filter: 2.0, lighting: Lighting::default(), refine_idle: true, refine_target: 16, progress_samples: 0, progress_tile: 0, motion_samples: 1, motion_recovery: 0, idle_deadline: None, idle_ready: false, last_scene: Vec::new(), egui_ctx: egui::Context::default(), egui_state: None, preset_status: String::new(), presets: preset_gallery::Gallery::default(), capture_slot: None, output: OutputSettings::default(), render_job: None, start_export: false, left_open: true, controls_tab: ControlsTab::default(), right_open: true, effects, background_color: DEFAULT_BACKGROUND, show_frame: true, frame: None, picking_focus: false, focus_point: None, focus_status: String::new(), history: history::History::default(), history_actions: Vec::new(), modifiers: winit::keyboard::ModifiersState::empty() }
+        Self { about: about::About::default(), startup: startup::Startup::default(), event_proxy: None, window: None, renderer: None, camera, keys: HashSet::new(), looking: false, last_frame: Instant::now(), slice: None, power: 8.0, fractal: Fractal::default(), mutation: MutationStage::default(), extra_mutations: Vec::new(), base_weight: 1.0, menger_parameters: MengerParameters::default(), mandelbox_parameters: MandelboxParameters::default(), mandelbulb_parameters: MandelbulbParameters::default(), fold_parameters: FoldParameters::default(), diagnostic: false, material: 0, matcap_rotation: 0.0, ao: false, ao_strength: 0.5, ao_radius: 0.048, exposure: 0.0, contrast: 1.0, normal_smoothing: 0.002, quality: 1.0, antialias: false, distant_filter: 2.0, lighting: Lighting::default(), refine_idle: true, refine_target: 16, progress_samples: 0, progress_tile: 0, motion_samples: 1, motion_recovery: 0, idle_deadline: None, idle_ready: false, last_scene: Vec::new(), egui_ctx: egui::Context::default(), egui_state: None, preset_status: String::new(), presets: preset_gallery::Gallery::default(), capture_slot: None, output: OutputSettings::default(), render_job: None, start_export: false, left_open: true, controls_tab: ControlsTab::default(), right_open: true, effects, background_color: DEFAULT_BACKGROUND, show_frame: true, frame: None, picking_focus: false, focus_point: None, focus_status: String::new(), history: history::History::default(), history_actions: Vec::new(), modifiers: winit::keyboard::ModifiersState::empty() }
     }
 }
 impl App {
@@ -996,7 +997,11 @@ impl App {
     fn ui(&mut self, ctx: &egui::Context) {
         if self.right_open {
             egui::SidePanel::right("render_output").default_width(255.0).resizable(true).show(ctx, |ui| {
-                ui.horizontal(|ui| { ui.heading("Render output"); if ui.small_button("▶").on_hover_text("Hide render panel").clicked() { self.right_open = false; } });
+                ui.horizontal(|ui| {
+                    ui.heading("Render output");
+                    if ui.small_button("▶").on_hover_text("Hide render panel").clicked() { self.right_open = false; }
+                    self.about_button(ui);
+                });
                 ui.separator();
                 ui.add_enabled_ui(self.render_job.is_none(), |ui| {
                     ui.horizontal(|ui| { ui.label("Width"); ui.add(egui::DragValue::new(&mut self.output.width).range(64..=8192).speed(4)); ui.label("px"); });
@@ -1013,7 +1018,12 @@ impl App {
                 ui.small("Images are saved in the renders folder.");
             });
         } else {
-            egui::Area::new("open_render".into()).anchor(egui::Align2::RIGHT_TOP, [-5.0, 5.0]).show(ctx, |ui| { if ui.small_button("◀").on_hover_text("Show render panel").clicked() { self.right_open = true; } });
+            egui::Area::new("open_render".into()).anchor(egui::Align2::RIGHT_TOP, [-5.0, 5.0]).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    self.about_button(ui);
+                    if ui.small_button("◀").on_hover_text("Show render panel").clicked() { self.right_open = true; }
+                });
+            });
         }
         if self.left_open {
             egui::SidePanel::left("controls")
@@ -1077,6 +1087,16 @@ impl App {
         }
         if !self.left_open || self.controls_tab != ControlsTab::Presets {
             self.presets.hide();
+        }
+        self.about.show(ctx, self.event_proxy.as_ref());
+    }
+
+    fn about_button(&mut self, ui: &mut egui::Ui) {
+        if ui.small_button("About").clicked() {
+            self.keys.clear();
+            self.looking = false;
+            self.camera.velocity = [0.0; 3];
+            self.about.open = true;
         }
     }
     fn formula_ui(&mut self, ui: &mut egui::Ui) {
@@ -1542,6 +1562,7 @@ impl ApplicationHandler<startup::Event> for App {
         let Some(window) = self.window.as_ref().cloned() else { return; };
         match event {
             startup::Event::Stage(stage) => self.startup.set_stage(stage),
+            startup::Event::UpdateChecked(result) => self.about.finish(result),
             startup::Event::CreateSurface { instance, reply } => startup::create_surface(window.clone(), instance, reply),
             startup::Event::Finished(Err(error)) => self.startup.fail(error),
             startup::Event::Finished(Ok(renderer)) => {
@@ -1590,7 +1611,7 @@ impl ApplicationHandler<startup::Event> for App {
         let mut text_history_shortcut = false;
         if let WindowEvent::KeyboardInput { event: key, is_synthetic: false, .. } = &event {
             let modifiers = self.modifiers;
-            if modifiers.control_key() && !modifiers.alt_key() && !modifiers.super_key()
+            if !self.about.open && modifiers.control_key() && !modifiers.alt_key() && !modifiers.super_key()
                 && matches!(key.physical_key, PhysicalKey::Code(KeyCode::KeyZ | KeyCode::KeyY))
             {
                 if !text_edit_is_focused(&self.egui_ctx) {
@@ -1623,7 +1644,7 @@ impl ApplicationHandler<startup::Event> for App {
             // for another redraw here would make the viewport render forever.
             if response.repaint && !matches!(event, WindowEvent::RedrawRequested) { window.request_redraw(); }
             if text_history_shortcut { return; }
-            if response.consumed && matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }) {
+            if (response.consumed || self.about.open) && matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }) {
                 if let WindowEvent::KeyboardInput { ref event, .. } = event { if event.state == ElementState::Released { if let PhysicalKey::Code(key) = event.physical_key { self.keys.remove(&key); } } }
                 if matches!(event, WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Right, .. }) { self.looking = false; }
                 return;
