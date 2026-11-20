@@ -195,8 +195,8 @@ mod tests {
                             app.exposure = 1.8;
                             app.quality = 1.1;
                             app.normal_smoothing = 0.005;
-                            app.antialias = true;
-                            let size = [renderer.config.width as f32, renderer.config.height as f32];
+                            let extent = [renderer.config.width, renderer.config.height];
+                            let size = extent.map(|side| side as f32);
                             let ctx = egui::Context::default();
                             renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
                             let tiles = renderer.config.width.div_ceil(crate::REFINE_TILE_WIDTH)
@@ -204,15 +204,15 @@ mod tests {
                             let mut capture = |progress, tile, divisor| -> Result<image::RgbaImage, String> {
                                 let data = app.camera_uniforms(size, progress, [0.0; 4], false);
                                 let gui = ctx.run(egui::RawInput::default(), |_| {});
-                                renderer.render(data, progress, progress.is_some(), tile, divisor, gui, &ctx, true)
+                                renderer.render(data, progress, progress.is_some(), tile, extent.map(|side| side.div_ceil(divisor)), gui, &ctx, true)
                                     .ok_or_else(|| "Viewport capture unavailable".to_string())?
                             };
                             let preview = capture(None, None, 4)?;
-                            let mut refined = capture(Some(0), Some(0), 1)?;
+                            let mut refined = capture(Some(0), Some(0..1), 1)?;
                             if tiles > 1 && refined != preview {
                                 return Err("The preview changed before the first sample completed".into());
                             }
-                            for tile in 1..tiles { refined = capture(Some(0), Some(tile), 1)?; }
+                            if tiles > 1 { refined = capture(Some(0), Some(1..tiles), 1)?; }
                             if refined != capture(Some(0), None, 1)? {
                                 return Err("Tiled refinement differs from a full pass".into());
                             }
@@ -222,6 +222,101 @@ mod tests {
                                 .map(|(a, b)| f32::from(a.abs_diff(*b))).sum::<f32>() / reduced.as_raw().len() as f32;
                             if mean_difference > 26.0 {
                                 return Err(format!("Menger blend lost its overall structure during navigation ({mean_difference:.1})"));
+                            }
+                            app.effects.dof_enabled = true;
+                            app.effects.aperture = 0.04;
+                            app.effects.focus = 0.15;
+                            let mut capture_dof = |sample, advance| -> Result<image::RgbaImage, String> {
+                                let progress = Some(sample);
+                                let data = app.camera_uniforms(size, progress, [0.0; 4], false);
+                                let gui = ctx.run(egui::RawInput::default(), |_| {});
+                                renderer.render(data, progress, advance, None, extent, gui, &ctx, true)
+                                    .ok_or_else(|| "Depth of field preview unavailable".to_string())?
+                            };
+                            let pinhole = capture_dof(0, true)?;
+                            let blurred = capture_dof(1, true)?;
+                            if pinhole == blurred || capture_dof(2, false)? != blurred {
+                                return Err("The full-resolution DOF preview did not accumulate or retain its samples".into());
+                            }
+                            let mut ao_scene = crate::App::default();
+                            ao_scene.camera.position = [0.0, 0.0, 3.2];
+                            ao_scene.camera.yaw = 0.0;
+                            ao_scene.camera.pitch = 0.0;
+                            ao_scene.effects.focal = 21.6;
+                            ao_scene.ao_strength = 1.0;
+                            ao_scene.ao_radius = 0.75;
+                            let mut capture_ao = |enabled| -> Result<image::RgbaImage, String> {
+                                ao_scene.ao = enabled;
+                                let reduced_extent = extent.map(|side| side.div_ceil(2));
+                                let data = ao_scene.camera_uniforms(size, Some(0), [0.0; 4], false);
+                                let gui = ctx.run(egui::RawInput::default(), |_| {});
+                                renderer.render(data, Some(0), true, None, reduced_extent, gui, &ctx, true)
+                                    .ok_or_else(|| "Ray-traced AO preview unavailable".to_string())?
+                            };
+                            if capture_ao(false)? == capture_ao(true)? {
+                                return Err("Ray-traced AO did not affect the reduced-resolution viewport".into());
+                            }
+                            ao_scene.lighting.path_traced = true;
+                            ao_scene.select_material(crate::DIFFUSE_GRAY_MATERIAL);
+                            ao_scene.lighting.enabled = false;
+                            let mut capture_path = |environment, sample| -> Result<image::RgbaImage, String> {
+                                ao_scene.lighting.environment = environment;
+                                let progress = Some(sample);
+                                let data = ao_scene.camera_uniforms(size, progress, [0.0; 4], false);
+                                let gui = ctx.run(egui::RawInput::default(), |_| {});
+                                renderer.render(data, progress, true, None, extent.map(|side| side.div_ceil(2)), gui, &ctx, true)
+                                    .ok_or_else(|| "Path-traced preview unavailable".to_string())?
+                            };
+                            let uniform = capture_path(0, 0)?;
+                            let copper = capture_path(3, 0)?;
+                            if uniform == copper || copper == capture_path(3, 1)? {
+                                return Err("Path-traced viewport did not respond to the environment or accumulate a new sample".into());
+                            }
+                            let mut capture_moving = |samples, bounces| -> Result<image::RgbaImage, String> {
+                                let mut data = ao_scene.camera_uniforms(size, None, [0.0; 4], false);
+                                data[crate::MOVING_SAMPLES_UNIFORM] = samples;
+                                data[crate::MOVING_BOUNCES_UNIFORM] = bounces;
+                                let gui = ctx.run(egui::RawInput::default(), |_| {});
+                                renderer.render(data, None, false, None, extent.map(|side| side.div_ceil(4)), gui, &ctx, true)
+                                    .ok_or_else(|| "Moving viewport preview unavailable".to_string())?
+                            };
+                            let four_samples = capture_moving(4.0, 1.0)?;
+                            if capture_moving(1.0, 1.0)? == four_samples {
+                                return Err("Moving viewport sample count did not change the preview".into());
+                            }
+                            if capture_moving(4.0, 4.0)? == four_samples {
+                                return Err("Moving viewport bounce count did not change the preview".into());
+                            }
+                            let denoise_extent = extent.map(|side| side.div_ceil(2));
+                            let capture_denoise = |renderer: &mut crate::Renderer, sample, advance| -> Result<image::RgbaImage, String> {
+                                let progress = Some(sample);
+                                let data = ao_scene.camera_uniforms(size, progress, [0.0; 4], false);
+                                let gui = ctx.run(egui::RawInput::default(), |_| {});
+                                renderer.render(data, progress, advance, None, denoise_extent, gui, &ctx, true)
+                                    .ok_or_else(|| "Denoised viewport unavailable".to_string())?
+                            };
+                            for backend in [crate::denoise::Backend::Cpu, crate::denoise::Backend::Gpu]
+                                .into_iter().filter(|backend| backend.available())
+                            {
+                                renderer.viewport_denoise.configure(Some(backend), true);
+                                capture_denoise(&mut renderer, 0, true)?;
+                                let noisy = capture_denoise(&mut renderer, 1, true)?;
+                                let (done, finished) = std::sync::mpsc::channel();
+                                renderer.viewport_denoise.start(&renderer.device, &renderer.queue, &renderer.accumulation,
+                                    denoise_extent, move || { let _ = done.send(()); });
+                                finished.recv_timeout(Duration::from_secs(15)).map_err(|error| error.to_string())?;
+                                renderer.poll_viewport_denoise();
+                                let filtered = capture_denoise(&mut renderer, 2, false)?;
+                                if let Some(error) = &renderer.viewport_denoise.error {
+                                    return Err(error.clone());
+                                }
+                                if noisy == filtered || renderer.viewport_denoise.display.is_none() {
+                                    return Err(format!("{} did not filter the viewport", backend.label()));
+                                }
+                                renderer.viewport_denoise.configure(None, true);
+                                if noisy != capture_denoise(&mut renderer, 2, false)? {
+                                    return Err("The original viewport was not restored after disabling denoising".into());
+                                }
                             }
                             match pollster::block_on(renderer.device.pop_error_scope()) {
                                 Some(error) => Err(error.to_string()),

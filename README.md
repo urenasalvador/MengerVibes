@@ -10,9 +10,11 @@ Es un proyecto experimental desarrollado mediante *vibe coding*, con la ayuda de
 
 - Explorar seis fórmulas: Menger, Mandelbulb, Mandelbox, KIFS, Amazing Surface y Pseudo-Kleinian.
 - Ajustar los parámetros de cada fórmula y combinar varias mediante mutaciones.
-- Cambiar el aspecto con matcaps, oclusión ambiental, niebla y profundidad de campo.
-- Guardar configuraciones en una galería de presets con miniaturas.
+- Iluminar la escena con trazado de caminos, luz direccional y entornos HDRI, o usar oclusión ambiental por rayos.
+- Elegir entre los materiales Diffuse, Standard y Matcap, y ajustar niebla, exposición y profundidad de campo.
+- Guardar configuraciones en una galería de presets con miniaturas y recuperar los ajustes de arranque con **Reset to Defaults**.
 - Renderizar a una resolución independiente del visor y guardar el resultado en `renders/`.
+- Reducir el ruido del visor y de los renders PNG con Open Image Denoise por CPU o GPU.
 
 ## Compilar y ejecutar en Windows
 
@@ -24,6 +26,10 @@ cargo run --release --locked
 
 El ejecutable queda en `target/release/mengervibes.exe`.
 
+### Open Image Denoise (opcional)
+
+Descarga el paquete oficial para Windows x64 de [Open Image Denoise 2.x](https://github.com/OpenImageDenoise/oidn/releases) y extrae su contenido en una carpeta `oidn` junto al ejecutable. La biblioteca debe quedar en `oidn/bin/OpenImageDenoise.dll`. Puedes elegir el denoiser del visor y el del render PNG por separado.
+
 ## Controles básicos
 
 | Control | Acción |
@@ -33,7 +39,6 @@ El ejecutable queda en `target/release/mengervibes.exe`.
 | Q / E | Bajar o subir |
 | Botón derecho del ratón + movimiento | Orientar la cámara |
 | R | Restablecer la cámara |
-| 1–6 | Cambiar de fórmula |
 
 ## Licencia
 

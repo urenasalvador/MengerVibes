@@ -1,7 +1,7 @@
 pub const SENSOR_HEIGHT_MM: f32 = 24.0;
 pub const DEFAULT_FOCAL_MM: f32 = 21.6;
 const MAX_APERTURE_RADIUS: f32 = 0.05;
-const MAX_F_STOP: f32 = 64.0;
+const MAX_F_STOP: f32 = 128.0;
 // The lens uses one scene unit per metre. Aperture is stored as a radius.
 const DIAMETER_MM_PER_SCENE_RADIUS: f32 = 2_000.0;
 

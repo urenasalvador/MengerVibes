@@ -23,7 +23,7 @@ struct Camera {
     lens: vec4<f32>,
     fog: vec4<f32>,
     viewport: vec4<f32>,
-    matcap: vec4<f32>,
+    preview: vec4<f32>,
     mandelbox: vec4<f32>,
     mandelbulb: vec4<f32>,
     menger: vec4<f32>,
@@ -34,8 +34,14 @@ struct Camera {
     pseudo_kleinian: vec4<f32>,
     mutation_stack: vec4<f32>,
     extra_mutations: array<MutationField, 8>,
+    environment_and_light_radius: vec4<f32>,
+    path_settings: vec4<f32>,
+    path_display: vec4<f32>,
+    surface_finish: vec4<f32>,
+    surface_emission: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var panorama: texture_2d<f32>;
 @vertex fn vs_main(@builtin(vertex_index) i: u32) -> VertexOut {
     var positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
     var out: VertexOut;
@@ -233,7 +239,7 @@ fn detail_level(p: vec3<f32>, iterations: f32) -> f32 {
     let extra_detail = max(-log2(distance_to_camera) - 2.0, 0.0);
     // Reduced previews evaluate a single nearby orbit level per sample.
     // Still frames and export blend adjacent levels at the full detail range.
-    if (camera.matcap.y > 0.0) {
+    if (camera.preview.y > 0.0) {
         return iterations + round(min(extra_detail, 4.0));
     }
     return iterations + min(extra_detail, 11.0);
@@ -330,68 +336,132 @@ fn normal(p: vec3<f32>, e: f32, iterations: f32, fallback: vec3<f32>) -> vec3<f3
     if (!(magnitude2 > 1e-24) || magnitude2 > 1e30) { return fallback; }
     return gradient * inverseSqrt(magnitude2);
 }
-// Approximate occlusion from nearby distance samples; this is not a path-traced result.
-fn ambient_occlusion(p: vec3<f32>, n: vec3<f32>, iterations: f32, side: f32) -> f32 {
-    var sum = 0.0;
-    for (var i = 1; i <= 4; i++) {
-        let h = camera.appearance.w * f32(i) * 0.25;
-        let d = max(side * distance_estimate(p + n * h, iterations), 0.0);
-        sum += max(h - d, 0.0) / h;
+fn appearance(point: vec3<f32>, n: vec3<f32>, view_direction: vec3<f32>, iterations: f32, side: f32, camera_distance: f32, light_sample: vec2<f32>, material: PathMaterial) -> vec3<f32> {
+    let azimuth = camera.light_settings.x;
+    let elevation = camera.light_settings.y;
+    var light_direction = normalize(vec3<f32>(sin(azimuth) * cos(elevation), sin(elevation), cos(azimuth) * cos(elevation)));
+    if (light_sample.x >= 0.0) {
+        let axis = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(light_direction.y) > 0.95);
+        let tangent = normalize(cross(axis, light_direction));
+        let bitangent = cross(light_direction, tangent);
+        let delta = light_sample.x * camera.environment_and_light_radius.w;
+        let radial = sqrt(delta * (2.0 - delta));
+        let angle = light_sample.y * 6.2831853;
+        light_direction = (1.0 - delta) * light_direction + radial * (cos(angle) * tangent + sin(angle) * bitangent);
     }
-    return clamp(1.0 - sum * 0.18 * camera.appearance.z, 0.05, 1.0);
-}
-// Procedural camera-oriented matcap-like shading, without image textures.
-fn appearance(n: vec3<f32>, forward: vec3<f32>, right: vec3<f32>, up: vec3<f32>, view_direction: vec3<f32>) -> vec3<f32> {
-    let mode = camera.appearance.x;
-    if (mode > 3.5 && mode < 4.5) {
-        let azimuth = camera.light_settings.x;
-        let elevation = camera.light_settings.y;
-        let light_direction = normalize(vec3<f32>(sin(azimuth) * cos(elevation), sin(elevation), cos(azimuth) * cos(elevation)));
-        let light_color = camera.light_color_metallic.rgb;
-        let metallic = camera.light_color_metallic.w;
-        let base = camera.surface.rgb;
-        let roughness = clamp(camera.surface.w, 0.05, 1.0);
-        let ndotl = max(dot(n, light_direction), 0.0);
-        let half_vector = normalize(light_direction + view_direction + vec3<f32>(0.000001));
-        let ndoth = max(dot(n, half_vector), 0.0);
-        let exponent = mix(256.0, 2.0, roughness * roughness);
-        let specular = pow(ndoth, exponent) * (exponent + 2.0) / 8.0;
-        let specular_color = mix(vec3<f32>(0.04), base, metallic);
-        let diffuse = base * (1.0 - metallic) * ndotl;
-        let direct = (diffuse + specular_color * specular * ndotl) * light_color * camera.light_settings.z;
-        let ambient = base * camera.light_settings.w;
-        return ambient + direct;
+    let light_color = camera.light_color_metallic.rgb;
+    let environment = camera.environment_and_light_radius.rgb;
+    var ndotl = max(dot(n, light_direction), 0.0);
+    if (ndotl > 0.0 && camera.light_settings.z > 0.0 && camera.display.w > 0.5) {
+        if (directional_shadow(point, n, light_direction, iterations, side, camera_distance)) {
+            ndotl = 0.0;
+        }
     }
-    if (mode < 0.5) {
-        let light = max(dot(n, normalize(vec3<f32>(0.5, 0.8, 1.0))), 0.0);
-        return vec3<f32>(0.18, 0.48, 0.62) * (0.2 + 0.8 * light);
-    }
-    // Sample the inverse rotation so positive angles turn the matcap counterclockwise.
-    let angle = camera.matcap.x;
-    let c = cos(angle);
-    let s = sin(angle);
-    let x = dot(n, right);
-    let y = dot(n, up);
-    let view_n = vec3<f32>(c * x + s * y, -s * x + c * y, dot(n, -forward));
-    let diffuse = max(dot(view_n, normalize(vec3<f32>(-0.4, 0.7, 0.8))), 0.0);
-    let rim = pow(1.0 - clamp(abs(view_n.z), 0.0, 1.0), 2.0);
-    let spec = pow(max(dot(view_n, normalize(vec3<f32>(-0.35, 0.55, 0.85))), 0.0), 24.0);
-    if (mode < 1.5) { return vec3<f32>(0.48, 0.53, 0.6) * (0.3 + 0.7 * diffuse) + vec3<f32>(0.5) * spec + vec3<f32>(0.1) * rim; }
-    if (mode < 2.5) { return vec3<f32>(0.47, 0.19, 0.07) * (0.25 + 0.8 * diffuse) + vec3<f32>(1.0, 0.65, 0.32) * spec + vec3<f32>(0.16, 0.06, 0.02) * rim; }
-    if (mode < 3.5) { return vec3<f32>(0.15, 0.08, 0.32) * (0.3 + 0.8 * diffuse) + vec3<f32>(0.08, 0.5, 0.7) * rim + vec3<f32>(0.75, 0.45, 0.9) * spec; }
-    let broad_spec = pow(max(dot(view_n, normalize(vec3<f32>(-0.35, 0.55, 0.85))), 0.0), 8.0);
-    let sharp_spec = pow(max(dot(view_n, normalize(vec3<f32>(-0.35, 0.55, 0.85))), 0.0), 64.0);
-    if (mode < 5.5) { return vec3<f32>(0.50, 0.33, 0.10) * (0.25 + 0.85 * diffuse) + vec3<f32>(1.0, 0.83, 0.42) * (0.5 * broad_spec + 0.6 * sharp_spec); }
-    if (mode < 6.5) { return vec3<f32>(0.22, 0.27, 0.34) * (0.22 + 0.8 * diffuse) + vec3<f32>(0.7, 0.8, 1.0) * (0.45 * broad_spec + sharp_spec) + vec3<f32>(0.15, 0.25, 0.4) * rim; }
-    if (mode < 7.5) { return vec3<f32>(0.54, 0.27, 0.18) * (0.35 + 0.65 * diffuse) + vec3<f32>(0.18, 0.10, 0.07) * broad_spec; }
-    if (mode < 8.5) { return vec3<f32>(0.04, 0.27, 0.22) * (0.3 + 0.8 * diffuse) + vec3<f32>(0.20, 0.95, 0.70) * (0.32 * broad_spec + 0.5 * sharp_spec) + vec3<f32>(0.04, 0.18, 0.12) * rim; }
-    return vec3<f32>(0.12, 0.06, 0.18) * (0.3 + 0.7 * diffuse) + vec3<f32>(0.70, 0.20, 0.60) * broad_spec + vec3<f32>(0.16, 0.50, 0.95) * rim + vec3<f32>(0.9, 0.8, 1.0) * sharp_spec;
+    let ambient = material.base * environment * coat_transmission(material.coat, dot(n, view_direction));
+    if (ndotl <= 0.0 || camera.light_settings.z <= 0.0) { return ambient; }
+    let direct = path_bsdf(material, n, view_direction, light_direction).value
+        * light_color * (camera.light_settings.z * PATH_PI * ndotl);
+    return ambient + direct;
 }
 const BULB_INTERIOR_ITERATIONS: i32 = 12;
 
 fn inside_escape_fractal(p: vec3<f32>) -> bool {
     return camera.mutation_stack.y == 0.0 && camera.parameters.y == MANDELBULB
         && bulb_escape(p, BULB_INTERIOR_ITERATIONS) == BULB_INTERIOR_ITERATIONS;
+}
+
+fn directional_shadow(point: vec3<f32>, n: vec3<f32>, direction: vec3<f32>, iterations: f32, side: f32, camera_distance: f32) -> bool {
+    let quality = clamp(camera.display.z, 0.5, 8.0);
+    let tolerance = max(0.00008, camera_distance * 0.00008) * distance_factor(camera_distance) / quality;
+    // Start on the visible side of the surface to avoid hitting the originating boundary.
+    let bias = 2.0 * tolerance;
+    let origin = point + n * bias;
+    var travel = bias;
+    let refined = camera.filtering.w > 0.5;
+    if (side == 0.0) {
+        // The Mandelbulb interior is traced with escape-time membership.
+        let budget = select(64, 112, refined);
+        let min_step = select(0.0015, 0.00065, refined) / sqrt(quality);
+        let max_step = select(0.16, 0.07, refined);
+        for (var i = 0; i < budget; i++) {
+            if (!inside_escape_fractal(origin + direction * travel)) { return true; }
+            if (travel >= 5.12) { break; }
+            travel = min(5.12, travel + clamp(travel * 0.16, min_step, max_step));
+        }
+        return false;
+    }
+    let budget = select(96, 160, refined);
+    for (var i = 0; i < budget && travel < 30.0; i++) {
+        let distance = side * distance_estimate(origin + direction * travel, iterations);
+        if (distance <= tolerance * 0.5) { return true; }
+        travel += distance * 0.8;
+    }
+    return false;
+}
+
+fn pixel_random(seed: u32) -> f32 {
+    var bits = seed;
+    bits = (bits ^ (bits >> 16u)) * 0x7feb352du;
+    bits = (bits ^ (bits >> 15u)) * 0x846ca68bu;
+    return f32((bits ^ (bits >> 16u)) >> 8u) / 16777216.0;
+}
+
+fn ao_ray_sample(pixel: vec2<u32>, index: f32) -> vec2<f32> {
+    if (camera.appearance.y <= 0.5 || camera.appearance.z <= 0.0) { return vec2<f32>(-1.0); }
+    return pixel_sample(pixel, index, 0u);
+}
+
+fn light_ray_sample(pixel: vec2<u32>, index: f32) -> vec2<f32> {
+    if (camera.display.w <= 0.5 || camera.environment_and_light_radius.w <= 0.0) { return vec2<f32>(-1.0); }
+    return pixel_sample(pixel, index, 672827u);
+}
+
+fn pixel_sample(pixel: vec2<u32>, index: f32, seed_offset: u32) -> vec2<f32> {
+    let seed = pixel.x * 1973u + pixel.y * 9277u + seed_offset;
+    let scramble = vec2<f32>(pixel_random(seed), pixel_random(seed + 26699u));
+    return fract(scramble + index * vec2<f32>(0.754877666, 0.569840296));
+}
+
+fn ray_traced_occlusion(point: vec3<f32>, n: vec3<f32>, iterations: f32, side: f32, camera_distance: f32, sample: vec2<f32>) -> f32 {
+    let radius = camera.appearance.w;
+    if (sample.x < 0.0 || radius <= 0.0) { return 1.0; }
+
+    let reference = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(n.z) > 0.95);
+    let tangent = normalize(cross(reference, n));
+    let bitangent = cross(n, tangent);
+    let angle = sample.y * 6.2831853;
+    let radial = sqrt(sample.x);
+    let ray = radial * (tangent * cos(angle) + bitangent * sin(angle)) + n * sqrt(1.0 - sample.x);
+    let hit_tolerance = max(0.00008, camera_distance * 0.00008) * distance_factor(camera_distance)
+        / clamp(camera.display.z, 0.5, 8.0);
+    let bias = min(2.0 * hit_tolerance, radius * 0.125);
+    let origin = point + n * bias;
+    var distance = bias;
+    var hit_distance = radius;
+    if (side == 0.0) {
+        // The Mandelbulb interior uses the same membership query as the primary ray.
+        for (var i = 1; i <= 32; i++) {
+            let fraction = f32(i) / 32.0;
+            distance = mix(bias, radius, fraction * fraction);
+            if (!inside_escape_fractal(origin + ray * distance)) {
+                hit_distance = distance;
+                break;
+            }
+        }
+    } else {
+        for (var i = 0; i < 64; i++) {
+            if (distance >= radius) { break; }
+            let step = side * distance_estimate(origin + ray * distance, iterations);
+            if (step <= bias * 0.25) {
+                hit_distance = distance;
+                break;
+            }
+            distance += step * 0.8;
+        }
+    }
+    // Let nearby blockers contribute fully, then soften the edge of the AO radius.
+    let occlusion = 1.0 - smoothstep(0.5 * radius, radius, hit_distance);
+    return max(0.05, 1.0 - camera.appearance.z * occlusion);
 }
 fn focal_scale() -> f32 {
     return select(1.8, camera.lens.x, camera.lens.x > 0.0);
@@ -402,7 +472,27 @@ fn fogged(color: vec3<f32>, distance: f32) -> vec4<f32> {
     return vec4<f32>(mix(camera.fog.rgb, color, visibility), 1.0);
 }
 
-fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool) -> vec4<f32> {
+struct SurfaceGuide {
+    albedo: vec3<f32>,
+    normal: vec3<f32>,
+}
+
+fn shade_surface(point: vec3<f32>, n: vec3<f32>, view: vec3<f32>, iterations: f32, side: f32, travel: f32,
+    world_to_view: mat3x3<f32>, occlusion_sample: vec2<f32>, light_sample: vec2<f32>, path_seed: u32,
+    guide: ptr<function, SurfaceGuide>) -> vec4<f32> {
+    let material = surface_material(surface_base_color(n, world_to_view));
+    *guide = SurfaceGuide(material.base, n);
+    var color: vec3<f32>;
+    if (camera.path_settings.x > 0.5) {
+        color = trace_light_path(point, n, view, side, travel, path_seed, material, world_to_view);
+    } else {
+        color = appearance(point, n, view, iterations, side, travel, light_sample, material)
+            * ray_traced_occlusion(point, n, iterations, side, travel, occlusion_sample) + material_emission(n, view);
+    }
+    return fogged(color * exp2(camera.display.x), travel);
+}
+
+fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool, occlusion_sample: vec2<f32>, light_sample: vec2<f32>, path_seed: u32, guide: ptr<function, SurfaceGuide>) -> vec4<f32> {
     let background = select(camera.background_color.rgb, vec3<f32>(0.015, 0.02, 0.04), camera.parameters.w > 0.5);
     if (camera.orientation.z > 0.5) {
         let p = vec3<f32>(uv.x * camera.position_aspect.w * 1.6, uv.y * 1.6, camera.orientation.w);
@@ -420,12 +510,13 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool) -> vec4<f32> {
     let iterations = 11.0;
     let yaw = camera.orientation.x;
     let pitch = camera.orientation.y;
+    let roll = camera.filtering.y;
     let forward = vec3<f32>(sin(yaw) * cos(pitch), sin(pitch), -cos(yaw) * cos(pitch));
     let base_right = vec3<f32>(cos(yaw), 0.0, sin(yaw));
     let base_up = cross(base_right, forward);
-    let roll = camera.filtering.y;
     let right = base_right * cos(roll) + base_up * sin(roll);
     let up = base_up * cos(roll) - base_right * sin(roll);
+    let world_to_view = transpose(mat3x3<f32>(right, up, -forward));
     let primary_ray = forward * focal_scale() + right * uv.x * camera.position_aspect.w + up * uv.y;
     let lens_shift = right * lens_offset.x + up * lens_offset.y;
     let origin = camera.position_aspect.xyz + lens_shift;
@@ -454,7 +545,7 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool) -> vec4<f32> {
         if (!hit) {
             if (camera.parameters.w > 0.5) { return vec4<f32>(1.0, 0.1, 0.05, 1.0); }
             if (focus_only) { return vec4<f32>(0.0); }
-            return fogged(background, 5.12);
+            return fogged(camera_background(background, ray), 5.12);
         }
         if (!focus_only && camera.parameters.w > 0.5) { return vec4<f32>(0.25, 0.65, 0.75, 1.0); }
         // Refine the transition. Features thinner than the step may still be missed.
@@ -467,10 +558,9 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool) -> vec4<f32> {
         }
         travel = high;
         if (focus_only) { return vec4<f32>(max(travel * dot(ray, forward), 0.0001)); }
-        let n = -normal(origin + ray * travel, adaptive_normal_step(travel), iterations, ray);
-        var color = appearance(n, forward, right, up, -ray);
-        if (camera.appearance.y > 0.5) { color *= ambient_occlusion(origin + ray * travel, n, iterations, 1.0); }
-        return fogged(color * exp2(camera.display.x), travel);
+        let point = origin + ray * travel;
+        let n = -normal(point, adaptive_normal_step(travel), iterations, ray);
+        return shade_surface(point, n, -ray, iterations, 0.0, travel, world_to_view, occlusion_sample, light_sample, path_seed, guide);
     }
     var closest_distance = 1e20;
     var closest_travel = 0.0;
@@ -484,7 +574,7 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool) -> vec4<f32> {
     // Only rays which have not converged continue beyond the regular budget.
     // The extra work is limited to still-frame rendering and export.
     // A mixed signed field can need more steps to resolve narrow surfaces.
-    let preview_budget = select(512, 256, camera.matcap.y > 0.0);
+    let preview_budget = select(512, 256, camera.preview.y > 0.0);
     let step_budget = select(preview_budget, 3072, camera.filtering.w > 0.5);
     for (var i = 0; i < step_budget; i++) {
         let d = side * distance_estimate(origin + ray * travel, iterations);
@@ -515,7 +605,7 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool) -> vec4<f32> {
             return vec4<f32>(1.0, 0.1, 0.05, 1.0);
         }
         if (camera.parameters.w > 0.5) { return vec4<f32>(background, 1.0); }
-        return fogged(background, 30.0);
+        return fogged(camera_background(background, ray), 30.0);
     }
     if (focus_only) { return vec4<f32>(max(travel * dot(ray, forward), 0.0001)); }
     if (camera.parameters.w > 0.5) {
@@ -526,10 +616,9 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool) -> vec4<f32> {
     // Sample the normal over roughly a pixel footprint to reduce unstable
     // high-frequency shading when the fractal has subpixel details.
     let normal_step = adaptive_normal_step(travel);
-    let n = side * normal(origin + ray * travel, normal_step, iterations, -side * ray);
-    var color = appearance(n, forward, right, up, -ray);
-    if (camera.appearance.y > 0.5) { color *= ambient_occlusion(origin + ray * travel, n, iterations, side); }
-    return fogged(color * exp2(camera.display.x), travel);
+    let point = origin + ray * travel;
+    let n = side * normal(point, normal_step, iterations, -side * ray);
+    return shade_surface(point, n, -ray, iterations, side, travel, world_to_view, occlusion_sample, light_sample, path_seed, guide);
 }
 
 fn viewport_uv(uv: vec2<f32>) -> vec2<f32> {
@@ -545,46 +634,48 @@ fn sample_lens(index: f32) -> vec2<f32> {
 }
 
 @fragment fn fs_focus() -> @location(0) f32 {
-    return trace(camera.render_region.xy, vec2<f32>(0.0), true).x;
-}
-
-fn sample_viewport(uv: vec2<f32>, jitter: vec2<f32>, lens_offset: vec2<f32>) -> vec4<f32> {
-    var columns = 1;
-    if (camera.parameters.w <= 0.5 && camera.display.w >= 0.5) {
-        // Use one interactive sample inside the bulb.
-        if (camera.orientation.z > 0.5 || !inside_escape_fractal(camera.position_aspect.xyz)) {
-            columns = select(2, 4, camera.display.w > 1.5);
-        }
-    }
-    let rows = select(1, 2, columns > 1 && camera.display.w >= 1.0);
-    let height = max(camera.parameters.z * max(camera.viewport.z, 1.0), 1.0);
-    let pixel = vec2<f32>(2.0 / (height * camera.position_aspect.w), 2.0 / height);
-    let count = rows * columns;
-    var sum = vec4<f32>(0.0);
-    // One call site keeps the native shader compiler from duplicating the ray marcher.
-    for (var sample = 0; sample < count; sample++) {
-        let cell = vec2<f32>(f32(sample % columns), f32(sample / columns));
-        var offset = (cell + vec2<f32>(0.5)) / vec2<f32>(f32(columns), f32(rows)) - vec2<f32>(0.5);
-        if (columns == 2 && rows == 1) { offset.y = offset.x; }
-        sum += trace(viewport_uv(uv + pixel * (offset + jitter)), lens_offset, false);
-    }
-    return sum / f32(count);
+    var guide: SurfaceGuide;
+    return trace(camera.render_region.xy, vec2<f32>(0.0), true, vec2<f32>(-1.0), vec2<f32>(-1.0), 0u, &guide).x;
 }
 
 @fragment fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    return apply_contrast(sample_viewport(in.uv, vec2<f32>(0.0), vec2<f32>(0.0)), camera.viewport.w);
+    var guide: SurfaceGuide;
+    return apply_contrast(viewport_samples(in, 0.0, false, &guide), camera.viewport.w);
 }
 
-// Each still-frame pass contributes one distinct subpixel sample.
+fn viewport_samples(in: VertexOut, first_index: f32, progressive: bool, guide_out: ptr<function, SurfaceGuide>) -> vec4<f32> {
+    let height = max(camera.parameters.z * max(camera.viewport.z, 1.0), 1.0);
+    let pixel = vec2<f32>(2.0 / (height * camera.position_aspect.w), 2.0 / height);
+    let position = vec2<u32>(in.position.xy);
+    let count = u32(clamp(camera.path_display.z, 1.0, 4.0));
+    var color = vec4<f32>(0.0);
+    for (var sample = 0u; sample < count; sample++) {
+        var guide: SurfaceGuide;
+        let index = first_index + f32(sample);
+        let offset = fract(vec2<f32>(0.5) + index * vec2<f32>(0.754877666, 0.569840296)) - vec2<f32>(0.5);
+        var ao_sample = vec2<f32>(-1.0);
+        var light_sample = vec2<f32>(-1.0);
+        if (progressive || count > 1u) {
+            ao_sample = ao_ray_sample(position, index);
+            light_sample = light_ray_sample(position, index);
+        }
+        color += trace(viewport_uv(in.uv + pixel * offset), sample_lens(index), false,
+            ao_sample, light_sample, path_pixel_seed(position, index), &guide);
+        (*guide_out).albedo += guide.albedo / f32(count);
+        (*guide_out).normal += guide.normal / f32(count);
+    }
+    return color / f32(count);
+}
+
 @fragment fn fs_progress(in: VertexOut) -> @location(0) vec4<f32> {
     let index = select(camera.filtering.z, 0.0, camera.parameters.w > 0.5);
-    let offset = fract(vec2<f32>(0.5) + index * vec2<f32>(0.754877666, 0.569840296)) - vec2<f32>(0.5);
-    return sample_viewport(in.uv, offset, sample_lens(index));
+    var guide: SurfaceGuide;
+    return viewport_samples(in, index, true, &guide);
 }
 
 // The export renderer renders independent tiles. Pixel coordinates remain
 // relative to the full output image, so neighbouring tiles line up exactly.
-@fragment fn fs_export(in: VertexOut) -> @location(0) vec4<f32> {
+fn export_sample(in: VertexOut, guide: ptr<function, SurfaceGuide>) -> vec4<f32> {
     let full_size = camera.render_region.zw;
     let pixel_position = camera.render_region.xy + in.position.xy;
     let uv = vec2<f32>(2.0 * pixel_position.x / full_size.x - 1.0,
@@ -592,5 +683,29 @@ fn sample_viewport(uv: vec2<f32>, jitter: vec2<f32>, lens_offset: vec2<f32>) -> 
     let index = camera.filtering.z;
     let offset = fract(vec2<f32>(0.5) + index * vec2<f32>(0.754877666, 0.569840296)) - vec2<f32>(0.5);
     let jitter = vec2<f32>(2.0 * offset.x / full_size.x, 2.0 * offset.y / full_size.y);
-    return trace(uv + jitter, sample_lens(index), false);
+    let position = vec2<u32>(pixel_position);
+    return trace(uv + jitter, sample_lens(index), false, ao_ray_sample(position, index), light_ray_sample(position, index), path_pixel_seed(position, index), guide);
+}
+
+@fragment fn fs_export(in: VertexOut) -> @location(0) vec4<f32> {
+    var guide: SurfaceGuide;
+    return export_sample(in, &guide);
+}
+
+struct ExportPasses {
+    @location(0) color: vec4<f32>,
+    @location(1) albedo: vec4<f32>,
+    @location(2) normal: vec4<f32>,
+}
+
+@fragment fn fs_progress_denoise(in: VertexOut) -> ExportPasses {
+    var guide: SurfaceGuide;
+    let color = viewport_samples(in, camera.filtering.z, true, &guide);
+    return ExportPasses(color, vec4<f32>(guide.albedo, 1.0), vec4<f32>(guide.normal, 1.0));
+}
+
+@fragment fn fs_export_denoise(in: VertexOut) -> ExportPasses {
+    var guide: SurfaceGuide;
+    let color = export_sample(in, &guide);
+    return ExportPasses(color, vec4<f32>(guide.albedo, 1.0), vec4<f32>(guide.normal, 1.0));
 }

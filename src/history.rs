@@ -7,8 +7,11 @@ const HISTORY_LIMIT: usize = 128;
 #[derive(Clone, PartialEq)]
 struct Snapshot {
     scene: [f32; PRESET_VALUE_COUNT],
+    hdri: Option<super::hdri::Panorama>,
     output_size: [u32; 2],
     output_samples: u32,
+    output_denoise: Option<crate::denoise::Backend>,
+    viewport_denoise: Option<crate::denoise::Backend>,
     show_frame: bool,
 }
 
@@ -16,16 +19,22 @@ impl Snapshot {
     fn capture(app: &App) -> Self {
         Self {
             scene: app.preset_values(),
+            hdri: app.hdri.clone(),
             output_size: [app.output.width, app.output.height],
             output_samples: app.output.samples,
+            output_denoise: app.output.denoise,
+            viewport_denoise: app.output.viewport_denoise,
             show_frame: app.show_frame,
         }
     }
 
     fn restore(self, app: &mut App) {
         app.restore_scene(&self.scene);
+        if app.hdri != self.hdri { app.set_hdri(self.hdri); }
         [app.output.width, app.output.height] = self.output_size;
         app.output.samples = self.output_samples;
+        app.output.denoise = self.output_denoise;
+        app.output.viewport_denoise = self.viewport_denoise;
         app.show_frame = self.show_frame;
         app.keys.clear();
         app.looking = false;

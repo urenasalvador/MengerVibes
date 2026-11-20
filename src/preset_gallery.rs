@@ -11,6 +11,7 @@ const CARD_SCROLL_ID: &str = "preset_cards";
 
 pub enum Action {
     Add,
+    ResetDefaults,
     Load(u64),
     Update(u64),
     Remove(u64),
@@ -196,11 +197,18 @@ impl Gallery {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, status: &str) -> Option<Action> {
-        let mut action = ui
-            .button("+ Add preset")
-            .on_hover_text("Save the current view as a new preset")
-            .clicked()
-            .then_some(Action::Add);
+        let mut action = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("+ Add preset").on_hover_text("Save the current view as a new preset").clicked() {
+                action = Some(Action::Add);
+            }
+            if ui.button("Reset to Defaults")
+                .on_hover_text("Restore the starting scene, camera and render settings")
+                .clicked()
+            {
+                action = Some(Action::ResetDefaults);
+            }
+        });
 
         // Reserve the scrollbar's width even during its first frame.
         ui.spacing_mut().scroll.floating = false;
