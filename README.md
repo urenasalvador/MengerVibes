@@ -1,5 +1,7 @@
 # MengerVibes
 
+<img src="assets/mengervibes.png" alt="Icono de MengerVibes" width="128">
+
 Explorador de fractales 3D en tiempo real para Windows, desarrollado en Rust con wgpu. Puedes volar por el interior de una esponja de Menger, combinar fórmulas fractales y exportar tus renders en PNG.
 
 Es un proyecto experimental desarrollado mediante *vibe coding*, con la ayuda de OpenAI.
