@@ -7,9 +7,13 @@ fn path_pixel_seed(pixel: vec2<u32>, sample_index: f32) -> u32 {
     return pixel.x * 1973u + pixel.y * 9277u + u32(sample_index) * 26699u;
 }
 
-fn path_random(seed: ptr<function, u32>) -> f32 {
+fn path_random_bits(seed: ptr<function, u32>) -> u32 {
     *seed += 0x9e3779b9u;
-    return pixel_random(*seed);
+    return pixel_hash(*seed);
+}
+
+fn path_random(seed: ptr<function, u32>) -> f32 {
+    return f32(path_random_bits(seed) >> 8u) / 16777216.0;
 }
 
 fn path_basis(axis: vec3<f32>) -> mat3x3<f32> {
@@ -24,18 +28,59 @@ fn path_direction(axis: vec3<f32>, cosine: f32, azimuth: f32) -> vec3<f32> {
     return path_basis(axis) * vec3<f32>(radial * cos(angle), radial * sin(angle), cosine);
 }
 
+fn rotate_environment(direction: vec3<f32>, angle: f32) -> vec3<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec3<f32>(direction.x * c - direction.z * s, direction.y, direction.z * c + direction.x * s);
+}
+
+fn panorama_uv(ray: vec3<f32>) -> vec2<f32> {
+    return vec2<f32>(fract(atan2(ray.x, -ray.z) / (2.0 * PATH_PI) + 0.5),
+        acos(clamp(ray.y, -1.0, 1.0)) / PATH_PI);
+}
+
+fn panorama_pdf(ray: vec3<f32>, dims: vec2<u32>) -> f32 {
+    let local_ray = rotate_environment(ray, camera.path_settings.z);
+    let cell = min(vec2<u32>(panorama_uv(local_ray) * vec2<f32>(dims)), dims - 1u);
+    return textureLoad(panorama_importance, vec2<i32>(cell), 0).z;
+}
+
+struct PanoramaSample {
+    ray: vec3<f32>,
+    pdf: f32,
+}
+
+fn sample_panorama(dims: vec2<u32>, seed: ptr<function, u32>) -> PanoramaSample {
+    let count = dims.x * dims.y;
+    // Rejection keeps buckets equiprobable for tables with arbitrary dimensions.
+    let cutoff = (0u - count) % count;
+    var bits = path_random_bits(seed);
+    while (bits < cutoff) { bits = path_random_bits(seed); }
+    let bucket = bits % count;
+    let entry = textureLoad(panorama_importance, vec2<i32>(vec2<u32>(bucket % dims.x, bucket / dims.x)), 0);
+    let index = select(u32(entry.y), bucket, path_random(seed) < entry.x);
+    let cell = vec2<u32>(index % dims.x, index / dims.x);
+    let pdf = textureLoad(panorama_importance, vec2<i32>(cell), 0).z;
+    let angle = ((f32(cell.x) + path_random(seed)) / f32(dims.x) - 0.5) * (2.0 * PATH_PI);
+    let theta_step = PATH_PI / f32(dims.y);
+    let cosine = mix(cos(f32(cell.y) * theta_step), cos(f32(cell.y + 1u) * theta_step), path_random(seed));
+    let sine = sqrt(max(0.0, 1.0 - cosine * cosine));
+    let local_ray = vec3<f32>(sine * sin(angle), cosine, -sine * cos(angle));
+    return PanoramaSample(rotate_environment(local_ray, -camera.path_settings.z), pdf);
+}
+
+fn mis_weight(pdf: f32, other_pdf: f32) -> f32 {
+    return pdf * pdf / (pdf * pdf + other_pdf * other_pdf);
+}
+
 fn world_radiance(direction: vec3<f32>) -> vec3<f32> {
     let style = u32(camera.path_settings.y);
     let tint = camera.environment_and_light_radius.rgb;
     if (style == 0u) { return tint; }
-    let angle = camera.path_settings.z;
-    let c = cos(angle);
-    let s = sin(angle);
-    let ray = vec3<f32>(direction.x * c - direction.z * s, direction.y, direction.z * c + direction.x * s);
+    let ray = rotate_environment(direction, camera.path_settings.z);
     if (style == 10u) {
         let dims = vec2<i32>(textureDimensions(panorama));
-        let uv = vec2<f32>(fract(atan2(ray.x, -ray.z) / (2.0 * PATH_PI) + 0.5),
-            acos(clamp(ray.y, -1.0, 1.0)) / PATH_PI);
+        let uv = panorama_uv(ray);
         let texel = uv * vec2<f32>(dims) - 0.5;
         let base = vec2<i32>(floor(texel));
         let fraction = fract(texel);
@@ -70,7 +115,7 @@ fn world_radiance(direction: vec3<f32>) -> vec3<f32> {
 }
 
 fn camera_background(background: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
-    if (camera.path_settings.x > 0.5 && camera.path_display.x > 0.5) {
+    if ((camera.path_settings.x > 0.5 || u32(camera.path_settings.y) == 10u) && camera.path_display.x > 0.5) {
         return world_radiance(direction) * exp2(camera.display.x);
     }
     return background;
@@ -263,6 +308,7 @@ fn path_intersection(origin: vec3<f32>, ray: vec3<f32>, side: f32, quality: f32,
 fn trace_light_path(first_point: vec3<f32>, first_normal: vec3<f32>, first_view: vec3<f32>, side: f32, first_distance: f32, pixel_seed: u32,
     first_material: PathMaterial, world_to_view: mat3x3<f32>) -> vec3<f32> {
     let refined = camera.filtering.w > 0.5;
+    let precise_march = refined || camera.four_branch_twist.y > 0.0;
     let limit = clamp(u32(select(camera.path_display.w, camera.path_settings.w, refined)), 1u, 8u);
     let quality = clamp(camera.display.z, 0.5, 8.0);
     var material = first_material;
@@ -270,7 +316,13 @@ fn trace_light_path(first_point: vec3<f32>, first_normal: vec3<f32>, first_view:
     let elevation = camera.light_settings.y;
     let sun = vec3<f32>(sin(azimuth) * cos(elevation), sin(elevation), cos(azimuth) * cos(elevation));
     let sun_radiance = camera.light_color_metallic.rgb * camera.light_settings.z * PATH_PI;
+    var importance_dims = vec2<u32>(1u);
+    if (refined && u32(camera.path_settings.y) == 10u && any(camera.environment_and_light_radius.rgb > vec3<f32>(0.0))) {
+        importance_dims = textureDimensions(panorama_importance);
+    }
+    let sample_environment = importance_dims.x > 1u;
     var seed = pixel_seed;
+    var environment_seed = pixel_seed ^ 0xa511e9b3u;
     var point = first_point;
     var n = first_normal;
     var view = first_view;
@@ -293,6 +345,22 @@ fn trace_light_path(first_point: vec3<f32>, first_normal: vec3<f32>, first_view:
             }
         }
 
+        let bias = 2.0 * max(0.00008, travel * 0.00008) * distance_factor(travel) / quality;
+        if (sample_environment) {
+            let light = sample_panorama(importance_dims, &environment_seed);
+            let cosine = dot(n, light.ray);
+            if (cosine > 0.0) {
+                let bsdf = path_bsdf(material, n, view, light.ray);
+                if (any(bsdf.value > vec3<f32>(0.0))) {
+                    let shadow_origin = point + n * bias + light.ray * bias;
+                    if (path_intersection(shadow_origin, light.ray, side, quality, precise_march) == -1.0) {
+                        let weight = mis_weight(light.pdf, bsdf.pdf);
+                        radiance += throughput * bsdf.value * world_radiance(light.ray) * (cosine * weight / light.pdf);
+                    }
+                }
+            }
+        }
+
         let lobe = path_random(&seed);
         let radial_sample = path_random(&seed);
         let angle_sample = path_random(&seed);
@@ -312,11 +380,14 @@ fn trace_light_path(first_point: vec3<f32>, first_normal: vec3<f32>, first_view:
             if (path_random(&seed) >= survival) { break; }
             throughput /= survival;
         }
-        let bias = 2.0 * max(0.00008, travel * 0.00008) * distance_factor(travel) / quality;
         let origin = point + n * bias + ray * bias;
-        travel = path_intersection(origin, ray, side, quality, refined);
+        travel = path_intersection(origin, ray, side, quality, precise_march);
         if (travel < 0.0) {
-            if (travel == -1.0) { radiance += throughput * world_radiance(ray); }
+            if (travel == -1.0) {
+                var weight = 1.0;
+                if (sample_environment) { weight = mis_weight(bsdf.pdf, panorama_pdf(ray, importance_dims)); }
+                radiance += throughput * world_radiance(ray) * weight;
+            }
             break;
         }
         if (bounce + 1u < limit) {

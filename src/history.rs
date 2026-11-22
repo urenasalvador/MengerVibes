@@ -12,6 +12,11 @@ struct Snapshot {
     output_samples: u32,
     output_denoise: Option<crate::denoise::Backend>,
     viewport_denoise: Option<crate::denoise::Backend>,
+    viewport_denoise_interval: u32,
+    intelligent_sampling: bool,
+    viewport_noise: crate::noise_sampling::Settings,
+    render_noise: crate::noise_sampling::Settings,
+    time_limit: f32,
     show_frame: bool,
 }
 
@@ -24,6 +29,11 @@ impl Snapshot {
             output_samples: app.output.samples,
             output_denoise: app.output.denoise,
             viewport_denoise: app.output.viewport_denoise,
+            viewport_denoise_interval: app.output.viewport_denoise_interval,
+            intelligent_sampling: app.output.intelligent_sampling,
+            viewport_noise: app.output.viewport_noise,
+            render_noise: app.output.render_noise,
+            time_limit: app.output.time_limit,
             show_frame: app.show_frame,
         }
     }
@@ -35,6 +45,11 @@ impl Snapshot {
         app.output.samples = self.output_samples;
         app.output.denoise = self.output_denoise;
         app.output.viewport_denoise = self.viewport_denoise;
+        app.output.viewport_denoise_interval = self.viewport_denoise_interval;
+        app.output.intelligent_sampling = self.intelligent_sampling;
+        app.output.viewport_noise = self.viewport_noise;
+        app.output.render_noise = self.render_noise;
+        app.output.time_limit = self.time_limit;
         app.show_frame = self.show_frame;
         app.keys.clear();
         app.looking = false;
@@ -144,7 +159,7 @@ mod tests {
         let mut app = App::default();
         let original_scale = app.mandelbox_parameters.scale;
         app.observe_history(false);
-        for scale in [-1.6, -1.7, -1.8] {
+        for scale in [-1.6, -1.7, -2.0] {
             app.mandelbox_parameters.scale = scale;
             app.observe_history(true);
         }
@@ -158,7 +173,7 @@ mod tests {
         app.mandelbox_parameters.scale = original_scale;
         app.observe_history(false);
         assert!(step(&mut app, Action::Redo));
-        assert_eq!(app.mandelbox_parameters.scale, -1.8);
+        assert_eq!(app.mandelbox_parameters.scale, -2.0);
 
         assert!(step(&mut app, Action::Undo));
         app.mandelbox_parameters.scale = -1.9;

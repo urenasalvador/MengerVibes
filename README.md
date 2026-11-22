@@ -8,13 +8,17 @@ Es un proyecto experimental desarrollado mediante *vibe coding*, con la ayuda de
 
 ## Qué puedes hacer
 
-- Explorar seis fórmulas: Menger, Mandelbulb, Mandelbox, KIFS, Amazing Surface y Pseudo-Kleinian.
+- Explorar ocho fórmulas: Menger, Mandelbulb, Mandelbox, KIFS, Amazing Surface, Pseudo-Kleinian, Sierpinski y Four-Branch Knot.
 - Ajustar los parámetros de cada fórmula y combinar varias mediante mutaciones.
-- Iluminar la escena con trazado de caminos, luz direccional y entornos HDRI, o usar oclusión ambiental por rayos.
+- Iluminar la escena con HDRI tanto en Path Traced como en Ambient + AO, y combinarlo con una luz direccional.
 - Elegir entre los materiales Diffuse, Standard y Matcap, y ajustar niebla, exposición y profundidad de campo.
 - Guardar configuraciones en una galería de presets con miniaturas y recuperar los ajustes de arranque con **Reset to Defaults**.
 - Renderizar a una resolución independiente del visor y guardar el resultado en `renders/`.
 - Reducir el ruido del visor y de los renders PNG con Open Image Denoise por CPU o GPU.
+
+## Windows x64
+
+Extrae el ZIP de la release y abre mengervibes.exe. Puedes consultar los cambios en [CHANGELOG.md](CHANGELOG.md).
 
 ## Compilar y ejecutar en Windows
 

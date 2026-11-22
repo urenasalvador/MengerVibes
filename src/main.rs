@@ -1,4 +1,5 @@
 mod about;
+mod adaptive_viewport;
 mod denoise;
 mod viewport_denoise;
 mod export;
@@ -7,6 +8,11 @@ mod history;
 mod hdri;
 mod preset_gallery;
 mod startup;
+mod pixel_sampling;
+mod intelligent_sampling;
+mod noise_sampling;
+#[cfg(test)]
+mod sampling_benchmark;
 use camera_effects::CameraEffects;
 use std::{collections::HashSet, sync::Arc, time::{Duration, Instant}};
 use winit::{application::ApplicationHandler, event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent}, event_loop::{ActiveEventLoop, EventLoop, ControlFlow}, keyboard::{KeyCode, PhysicalKey}, window::{Window, WindowId}};
@@ -19,7 +25,15 @@ const BASE_PRESET_FIELDS: usize = 103;
 const LIGHTING_UNIFORM_OFFSET: usize = 100 + MAX_MUTATIONS * EXTRA_MUTATION_UNIFORMS;
 const PATH_UNIFORM_OFFSET: usize = LIGHTING_UNIFORM_OFFSET + 4;
 const SURFACE_UNIFORM_OFFSET: usize = PATH_UNIFORM_OFFSET + 8;
-const CAMERA_UNIFORM_FLOATS: usize = SURFACE_UNIFORM_OFFSET + 8;
+const SIERPINSKI_UNIFORM_OFFSET: usize = SURFACE_UNIFORM_OFFSET + 8;
+const ORBIT_DEPTH_UNIFORM_OFFSET: usize = SIERPINSKI_UNIFORM_OFFSET + 4;
+const FOUR_BRANCH_UNIFORM_OFFSET: usize = ORBIT_DEPTH_UNIFORM_OFFSET + 4;
+const FULL_PRECISION_PREVIEW_UNIFORM: usize = FOUR_BRANCH_UNIFORM_OFFSET + 5;
+const PIXEL_SAMPLING_UNIFORM: usize = FOUR_BRANCH_UNIFORM_OFFSET + 6;
+const NAVIGATION_SAMPLE_UNIFORM: usize = FOUR_BRANCH_UNIFORM_OFFSET + 7;
+const NOISE_SAMPLING_UNIFORM: usize = FOUR_BRANCH_UNIFORM_OFFSET + 8;
+const BOKEH_UNIFORM_OFFSET: usize = NOISE_SAMPLING_UNIFORM + 1;
+const CAMERA_UNIFORM_FLOATS: usize = NOISE_SAMPLING_UNIFORM + 4;
 const CAMERA_UNIFORM_BYTES: u64 = (CAMERA_UNIFORM_FLOATS * std::mem::size_of::<f32>()) as u64;
 const CONTRAST_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
 const AO_STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=4.0;
@@ -33,18 +47,25 @@ const PRESET_MOVING_BOUNCES: usize = PRESET_MOVING_SAMPLES + 1;
 const PRESET_SURFACE_FIELDS: usize = PRESET_MOVING_BOUNCES + 1;
 const PRESET_PRINCIPLED_FIELDS: usize = PRESET_SURFACE_FIELDS + 5;
 const PRESET_MATCAP_FIELDS: usize = PRESET_PRINCIPLED_FIELDS + 16;
-const PRESET_VALUE_COUNT: usize = PRESET_MATCAP_FIELDS + 12;
+const PRESET_SIERPINSKI_FIELDS: usize = PRESET_MATCAP_FIELDS + 12;
+const PRESET_ORBIT_DEPTH_FIELDS: usize = PRESET_SIERPINSKI_FIELDS + 1 + MAX_MUTATIONS;
+const PRESET_FOUR_BRANCH_FIELDS: usize = PRESET_ORBIT_DEPTH_FIELDS + 4 * (1 + MAX_MUTATIONS);
+const PRESET_BOKEH_FIELDS: usize = PRESET_FOUR_BRANCH_FIELDS + 4 * (1 + MAX_MUTATIONS);
+const PRESET_VALUE_COUNT: usize = PRESET_BOKEH_FIELDS + 2;
+const MAX_FORMULA_DEPTH: u32 = 14;
 const LIGHT_ANGULAR_RADIUS: std::ops::RangeInclusive<f32> = 0.0..=45.0;
 const DEFAULT_VIEWPORT_SAMPLES: u32 = 16;
 const STARTING_FOCAL_MM: f32 = 60.0;
-const SAMPLE_COUNTS: [u32; 9] = [1, 4, 8, 16, 32, 64, 128, 256, 512];
 const MOVING_SAMPLE_COUNTS: [u32; 3] = [1, 2, 4];
 const MOVING_SAMPLES_UNIFORM: usize = PATH_UNIFORM_OFFSET + 6;
 const MOVING_BOUNCES_UNIFORM: usize = PATH_UNIFORM_OFFSET + 7;
 const DEFAULT_BACKGROUND: [f32; 3] = [0.015, 0.02, 0.04];
 const DETAIL_QUALITY: std::ops::RangeInclusive<f32> = 0.5..=8.0;
-const SMOOTHNESS: std::ops::RangeInclusive<f32> = 0.000020..=0.2;
-const FRACTAL_SHADER: &str = concat!(include_str!("contrast.wgsl"), "\n", include_str!("fractal.wgsl"), "\n", include_str!("path_tracer.wgsl"));
+const SMOOTHNESS: std::ops::RangeInclusive<f32> = 0.0..=0.2;
+const SMOOTHNESS_KEY_FLOOR: f32 = 0.000020;
+const FRACTAL_SHADER: &str = concat!(include_str!("contrast.wgsl"), "\n", include_str!("fractal.wgsl"), "\n",
+    include_str!("path_tracer.wgsl"), "\n", include_str!("pixel_sampling.wgsl"), "\n", include_str!("intelligent_sampling.wgsl"), "\n",
+    include_str!("noise_sampling.wgsl"));
 const COMPOSITE_SHADER: &str = concat!(include_str!("contrast.wgsl"), "\n", include_str!("composite.wgsl"));
 const REFINE_TILE_WIDTH: u32 = 256;
 const REFINE_TILE_HEIGHT: u32 = 128;
@@ -166,15 +187,27 @@ struct Renderer {
     focus_bind: wgpu::BindGroup,
     progress_pipeline: wgpu::RenderPipeline,
     camera_layout: wgpu::BindGroupLayout,
-    fallback_environment: wgpu::TextureView,
-    environment_view: Option<wgpu::TextureView>,
+    blue_noise: wgpu::TextureView,
+    fallback_environment: hdri::Environment,
+    environment_view: Option<hdri::Environment>,
     composite_pipeline: wgpu::RenderPipeline,
     accumulation: wgpu::Texture,
     composite_bind: wgpu::BindGroup,
     preview: wgpu::Texture,
     preview_bind: wgpu::BindGroup,
     preview_dimensions: Option<[f32; 2]>,
+    viewport_in_flight: Option<adaptive_viewport::InFlight>,
+    poll_redraw: bool,
+    viewport_timing: Option<adaptive_viewport::GpuTiming>,
+    noise_pipelines: Arc<std::sync::OnceLock<noise_sampling::Pipelines>>,
+    noise_compiling: [bool; 2],
+    noise_buffers: Option<noise_sampling::Buffers>,
+    noise_plan: Option<noise_sampling::Plan>,
+    noise_pending: Option<noise_sampling::Readback>,
+    noise_remaining: Option<u32>,
+    noise_tiles: Option<noise_sampling::ActiveTiles>,
     viewport_denoise: viewport_denoise::ViewportDenoise,
+    intelligent_sampling: intelligent_sampling::IntelligentSampling,
     frame_submitted: bool,
     egui_renderer: egui_wgpu::Renderer,
     export_pipelines: Arc<std::sync::OnceLock<export::Pipelines>>,
@@ -195,7 +228,8 @@ impl Renderer {
         }).await.ok_or("No compatible GPU found")?;
         println!("GPU: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
         stage("Preparing the graphics device");
-        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await
+        let required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor { required_features, ..Default::default() }, None).await
             .map_err(|error| format!("GPU device: {error}"))?;
         let mut config = surface.get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or("The GPU does not support the window surface")?;
@@ -230,9 +264,10 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let fallback_environment = hdri::upload(&device, &queue, 1, 1, &[0.0; 3]);
-        let camera_bind = hdri::bind(&device, &camera_layout, &camera_buffer, &fallback_environment);
+        let blue_noise = pixel_sampling::blue_noise_view(&device, &queue);
+        let camera_bind = hdri::bind(&device, &camera_layout, &camera_buffer, &fallback_environment, &blue_noise);
         stage("Compiling focus and progressive shaders");
-        let (focus_pipeline, focus_bind) = Self::create_focus_pipeline(&device, &shader, &camera_buffer, &fallback_environment);
+        let (focus_pipeline, focus_bind) = Self::create_focus_pipeline(&device, &shader, &camera_buffer, &fallback_environment, &blue_noise);
         let progress_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Progressive fractal"), layout: Some(&layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[] },
@@ -258,20 +293,25 @@ impl Renderer {
         let (accumulation, composite_bind) = Self::create_accumulation(&device, &composite_pipeline, &camera_buffer, config.width, config.height);
         let (preview, preview_bind) = Self::create_accumulation(&device, &composite_pipeline, &camera_buffer, config.width, config.height);
         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+        let viewport_timing = required_features.contains(wgpu::Features::TIMESTAMP_QUERY)
+            .then(|| adaptive_viewport::GpuTiming::new(&device, &queue));
         Ok(Self { surface, device, queue, config, pipeline, camera_buffer, camera_bind, focus_pipeline, focus_bind,
-            progress_pipeline, camera_layout, fallback_environment, environment_view: None, composite_pipeline, accumulation,
-            composite_bind, preview, preview_bind, preview_dimensions: None, viewport_denoise: Default::default(), frame_submitted: false, egui_renderer,
-            export_pipelines: Arc::default() })
+            progress_pipeline, camera_layout, blue_noise, fallback_environment, environment_view: None, composite_pipeline, accumulation,
+            composite_bind, preview, preview_bind, preview_dimensions: None, viewport_denoise: Default::default(),
+            intelligent_sampling: Default::default(), frame_submitted: false, egui_renderer,
+            viewport_in_flight: None, poll_redraw: false, viewport_timing, export_pipelines: Arc::default(),
+            noise_pipelines: Arc::default(), noise_compiling: [false; 2], noise_buffers: None,
+            noise_plan: None, noise_pending: None, noise_remaining: None, noise_tiles: None })
     }
 
-    fn set_environment(&mut self, view: Option<&wgpu::TextureView>) {
+    fn set_environment(&mut self, view: Option<&hdri::Environment>) {
         if self.environment_view.as_ref() == view { return; }
         self.environment_view = view.cloned();
         self.camera_bind = hdri::bind(&self.device, &self.camera_layout, &self.camera_buffer,
-            view.unwrap_or(&self.fallback_environment));
+            view.unwrap_or(&self.fallback_environment), &self.blue_noise);
     }
 
-    fn create_focus_pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule, camera_buffer: &wgpu::Buffer, environment: &wgpu::TextureView) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
+    fn create_focus_pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule, camera_buffer: &wgpu::Buffer, environment: &hdri::Environment, blue_noise: &wgpu::TextureView) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
         let camera_layout = hdri::layout(device, false);
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Focus camera"), bind_group_layouts: &[&camera_layout], push_constant_ranges: &[],
@@ -282,7 +322,7 @@ impl Renderer {
             fragment: Some(wgpu::FragmentState { module: shader, entry_point: Some("fs_focus"), compilation_options: Default::default(), targets: &[Some(wgpu::TextureFormat::R32Float.into())] }),
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview: None, cache: None,
         });
-        let focus_bind = hdri::bind(device, &camera_layout, camera_buffer, environment);
+        let focus_bind = hdri::bind(device, &camera_layout, camera_buffer, environment, blue_noise);
         (focus_pipeline, focus_bind)
     }
 
@@ -367,24 +407,75 @@ impl Renderer {
         (self.preview, self.preview_bind) = Self::create_accumulation(&self.device, &self.composite_pipeline, &self.camera_buffer, width, height);
         self.preview_dimensions = None;
         self.viewport_denoise.resize();
+        self.intelligent_sampling.invalidate_view();
+        self.noise_buffers = None;
+        self.noise_pending = None;
+        self.noise_remaining = None;
+        self.noise_tiles = None;
     }
 
     fn poll_viewport_denoise(&mut self) {
         self.viewport_denoise.poll(&self.device, &self.queue, &self.composite_pipeline, &self.camera_buffer, self.accumulation.size());
     }
 
-    fn render(&mut self, mut data: [f32; CAMERA_UNIFORM_FLOATS], progress: Option<u32>, advance: bool, refine_tiles: Option<std::ops::Range<u32>>, render_size: [u32; 2], gui: egui::FullOutput, ctx: &egui::Context, capture: bool) -> Option<Result<image::RgbaImage, String>> {
+    fn prepare_intelligent_sampling(&mut self, denoise: bool, wake: impl FnOnce() + Send + 'static) -> bool {
+        self.intelligent_sampling.request(&self.device, &self.camera_layout, &self.camera_buffer, &self.accumulation, denoise, wake)
+    }
+
+    fn prepare_noise_sampling(&mut self, denoise: bool, window: Arc<Window>) -> bool {
+        if self.noise_pipelines.get().is_some_and(|pipelines| pipelines.ready(denoise)) { return true; }
+        let requested = &mut self.noise_compiling[usize::from(denoise)];
+        if !*requested {
+            *requested = true;
+            let pipelines = self.noise_pipelines.clone();
+            let device = self.device.clone();
+            let camera = self.camera_layout.clone();
+            std::thread::spawn(move || {
+                pipelines.get_or_init(|| noise_sampling::Pipelines::new(&device, false)).sample_pipeline(&device, &camera, denoise);
+                window.request_redraw();
+            });
+        }
+        false
+    }
+
+    fn poll_noise_sampling(&mut self) {
+        if let Some(pending) = &self.noise_pending {
+            let _ = self.device.poll(wgpu::Maintain::Poll);
+            if let Some(result) = pending.poll() {
+                self.noise_pending = None;
+                if let Some((remaining, tiles)) = result {
+                    self.noise_remaining = Some(remaining);
+                    self.noise_tiles = Some(tiles);
+                }
+            }
+        }
+    }
+
+    fn poll_viewport_work(&mut self) -> Option<Option<adaptive_viewport::PassStats>> {
+        let pending = self.viewport_in_flight.as_ref()?;
+        let _ = self.device.poll(wgpu::Maintain::Poll);
+        let result = pending.poll(self.viewport_timing.as_ref())?;
+        self.viewport_in_flight = None;
+        Some(result)
+    }
+
+    fn render(&mut self, mut data: [f32; CAMERA_UNIFORM_FLOATS], progress: Option<u32>, advance: bool, refine_tiles: Option<std::ops::Range<u32>>, render_size: [u32; 2], gui: egui::FullOutput, ctx: &egui::Context, capture: bool, adaptive: bool, preview_work: Option<adaptive_viewport::PreviewWork>) -> Option<Result<image::RgbaImage, String>> {
         self.frame_submitted = false;
         let full_size = [self.config.width, self.config.height];
-        let preview_size = (render_size != full_size).then(|| render_size.map(|side| side as f32));
+        let preview_size = (render_size != full_size || preview_work.is_some()).then(|| render_size.map(|side| side as f32));
         if let Some([width, height]) = preview_size {
-            data[10] *= height / self.config.height as f32;
+            if preview_work.is_some() {
+                data[FULL_PRECISION_PREVIEW_UNIFORM] = self.config.height as f32;
+            } else {
+                data[10] *= height / self.config.height as f32;
+            }
             data[53] = width;
         }
-        let columns = render_size[0].div_ceil(REFINE_TILE_WIDTH);
-        let rows = render_size[1].div_ceil(REFINE_TILE_HEIGHT);
-        let needs_cached_preview = refine_tiles.as_ref()
-            .is_some_and(|tiles| progress == Some(0) && tiles.end < columns * rows);
+        let [columns, rows] = noise_sampling::viewport_tile_grid(render_size);
+        let active_tiles = self.noise_tiles.as_ref().filter(|_| self.noise_plan.is_some());
+        let tile_count = active_tiles.map_or(columns * rows, noise_sampling::ActiveTiles::len);
+        let sample_incomplete = refine_tiles.as_ref().is_some_and(|tiles| tiles.end < tile_count);
+        let needs_cached_preview = progress == Some(0) && sample_incomplete;
         let cached_preview = needs_cached_preview.then_some(self.preview_dimensions).flatten();
         // Composite dimensions are separate from the tracing controls. This
         // keeps the cached preview available while the first sample renders.
@@ -392,6 +483,7 @@ impl Renderer {
         data[54] = preview_size.map_or(0.0, |size| size[1]);
         data[55] = display_size[0];
         data[83] = display_size[1];
+        data[NOISE_SAMPLING_UNIFORM] = full_size[0] as f32;
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_ne_bytes()).collect();
         self.queue.write_buffer(&self.camera_buffer, 0, &bytes);
         let frame = match self.surface.get_current_texture() {
@@ -404,26 +496,44 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        let timing = self.viewport_timing.as_ref().filter(|_| preview_work.is_some());
+        let mut convergence = None;
         if advance || (progress.is_none() && preview_size.is_some()) {
             let index = progress.unwrap_or(0);
             let first_tile = refine_tiles.as_ref().is_none_or(|tiles| tiles.start == 0);
             let target = if progress.is_some() { &self.accumulation } else { &self.preview };
             let accumulation_view = target.create_view(&Default::default());
-            let guided = advance && self.viewport_denoise.prepare(&self.device, &self.camera_layout, target.size());
-            let guide_views = self.viewport_denoise.guides.as_ref().filter(|_| guided)
+            let denoise_guides = advance && self.viewport_denoise.prepare(&self.device, &self.camera_layout, target.size());
+            let noise = self.noise_plan.filter(|_| advance).zip(self.noise_pipelines.get()).map(|(plan, pipelines)| {
+                let buffers = self.noise_buffers.get_or_insert_with(|| noise_sampling::Buffers::new(&self.device, pipelines, target));
+                if index == 0 && first_tile { buffers.reset(&mut encoder); }
+                (plan, pipelines, buffers)
+            });
+            let guided_sampling = advance && self.intelligent_sampling.enabled;
+            let ray_guides = self.intelligent_sampling.resources().filter(|_| guided_sampling && index != 1);
+            let guide_views = self.viewport_denoise.guides.as_ref().filter(|_| denoise_guides)
                 .map(|guides| guides.each_ref().map(|texture| texture.create_view(&Default::default())));
             let load = if index == 0 && first_tile { wgpu::LoadOp::Clear(wgpu::Color::BLACK) } else { wgpu::LoadOp::Load };
             let attachment = |view| Some(wgpu::RenderPassColorAttachment {
                 view, resolve_target: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
             });
             let mut attachments = vec![attachment(&accumulation_view)];
+            if let Some((_, _, buffers)) = &noise { attachments.push(attachment(&buffers.half_view)); }
+            if let Some(guides) = ray_guides.filter(|_| index == 0) { attachments.push(attachment(guides.geometry())); }
             if let Some(views) = &guide_views { attachments.extend(views.iter().map(attachment)); }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render viewport sample"), color_attachments: &attachments,
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                depth_stencil_attachment: None, timestamp_writes: timing.map(adaptive_viewport::GpuTiming::writes), occlusion_query_set: None,
             });
-            let pipeline = self.viewport_denoise.pipeline.as_ref().filter(|_| guided).unwrap_or(&self.progress_pipeline);
-            pass.set_pipeline(pipeline);
+            if let Some((_, pipelines, buffers)) = &noise {
+                pass.set_pipeline(pipelines.sample_pipeline(&self.device, &self.camera_layout, denoise_guides));
+                pass.set_bind_group(1, &buffers.mask_bind, &[]);
+            } else if let Some(guides) = ray_guides {
+                guides.bind(&mut pass, index == 0, denoise_guides);
+            } else {
+                let pipeline = self.viewport_denoise.pipeline.as_ref().filter(|_| denoise_guides).unwrap_or(&self.progress_pipeline);
+                pass.set_pipeline(pipeline);
+            }
             pass.set_bind_group(0, &self.camera_bind, &[]);
             let weight = 1.0 / (index + 1) as f64;
             pass.set_blend_constant(wgpu::Color { r: weight, g: weight, b: weight, a: 1.0 });
@@ -431,8 +541,9 @@ impl Renderer {
             if let Some([width, height]) = preview_size {
                 pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
             }
-            if let Some(tiles) = refine_tiles {
-                for tile in tiles {
+            if let Some(tiles) = refine_tiles.or_else(|| active_tiles.filter(|_| advance).map(|tiles| 0..tiles.len())) {
+                for index in tiles {
+                    let tile = active_tiles.map_or(index, |tiles| tiles.tile(index));
                     let x = (tile % columns) * REFINE_TILE_WIDTH;
                     let y = (tile / columns) * REFINE_TILE_HEIGHT;
                     pass.set_scissor_rect(x, y, REFINE_TILE_WIDTH.min(render_size[0] - x), REFINE_TILE_HEIGHT.min(render_size[1] - y));
@@ -441,7 +552,23 @@ impl Renderer {
             } else {
                 pass.draw(0..3, 0..1);
             }
+            drop(pass);
+            if let Some((plan, pipelines, buffers)) = noise {
+                if !sample_incomplete && index + 1 == plan.next_check(index) {
+                    convergence = Some(buffers.check(&self.device, &self.queue, &mut encoder, pipelines, render_size, plan, index + 1));
+                }
+            }
+            if guided_sampling && !sample_incomplete {
+                if let Some(guides) = ray_guides.filter(|_| index == 0) {
+                    guides.save_first_sample(&mut encoder, target, render_size);
+                } else if index == 1 {
+                    if let Some(guides) = self.intelligent_sampling.resources() {
+                        guides.allocate(&mut encoder, render_size);
+                    }
+                }
+            }
         }
+        if let Some(timing) = timing { timing.resolve(&mut encoder, &self.device, &self.preview, &self.camera_buffer); }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Fractal"),
@@ -488,12 +615,20 @@ impl Renderer {
             self.egui_renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
         }
         self.queue.submit(buffers.into_iter().chain(Some(encoder.finish())));
+        if let Some(buffer) = convergence { self.noise_pending = Some(noise_sampling::Readback::new(buffer)); }
+        if adaptive {
+            self.viewport_in_flight = Some(adaptive_viewport::InFlight::submit(&self.queue, timing, preview_work));
+        }
         self.frame_submitted = true;
         if progress.is_none() {
             self.preview_dimensions = preview_size;
         }
         for id in &gui.textures_delta.free { self.egui_renderer.free_texture(id); }
         frame.present();
+        if let Some(samples) = progress.filter(|_| cached_preview.is_none() && self.viewport_denoise.display.is_some()) {
+            let completed_sample = advance && !sample_incomplete;
+            self.viewport_denoise.record_presentation(samples + u32::from(completed_sample));
+        }
         if !capture { return None; }
         let Some(buffer) = capture_buffer else { return Some(Err("Screenshot is not supported by this graphics surface".into())); };
         let slice = buffer.slice(..);
@@ -552,6 +687,10 @@ impl Default for Lighting {
 }
 
 impl Lighting {
+    fn environment_intensity_max(&self) -> f32 {
+        if self.environment == HDRI_ENVIRONMENT { 10.0 } else { 2.0 }
+    }
+
     fn path_preset(&self) -> [f32; 6] {
         // The last slot was the path-only diffuse material toggle.
         [flag(self.path_traced), self.environment as f32, self.environment_rotation,
@@ -568,10 +707,12 @@ enum Fractal {
     Kifs = 3,
     AmazingSurface = 4,
     PseudoKleinian = 5,
+    Sierpinski = 6,
+    FourBranch = 7,
 }
 
 impl Fractal {
-    const ALL: [Self; 6] = [Self::Mandelbulb, Self::Mandelbox, Self::Menger, Self::Kifs, Self::AmazingSurface, Self::PseudoKleinian];
+    const ALL: [Self; 8] = [Self::Mandelbulb, Self::Mandelbox, Self::Menger, Self::Kifs, Self::AmazingSurface, Self::PseudoKleinian, Self::Sierpinski, Self::FourBranch];
 
     fn name(self) -> &'static str {
         match self {
@@ -581,6 +722,8 @@ impl Fractal {
             Self::Kifs => "KIFS",
             Self::AmazingSurface => "Amazing Surface",
             Self::PseudoKleinian => "Pseudo-Kleinian",
+            Self::Sierpinski => "Sierpinski Tetrahedron",
+            Self::FourBranch => "Four-Branch Knot",
         }
     }
 
@@ -588,6 +731,132 @@ impl Fractal {
 
     fn from_value(value: f32) -> Option<Self> {
         Self::ALL.into_iter().find(|formula| formula.value() == value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FourBranchParameters {
+    depth: u32,
+    thickness: f32,
+    spread: f32,
+    twist: f32,
+}
+
+impl Default for FourBranchParameters {
+    fn default() -> Self {
+        Self { depth: 5, thickness: 0.16, spread: 1.05, twist: 32.0 }
+    }
+}
+
+impl FourBranchParameters {
+    const MAX_DEPTH: u32 = MAX_FORMULA_DEPTH;
+    const THICKNESS: std::ops::RangeInclusive<f32> = 0.055..=0.24;
+    const SPREAD: std::ops::RangeInclusive<f32> = 0.72..=1.35;
+    const TWIST: std::ops::RangeInclusive<f32> = -90.0..=90.0;
+
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        egui::ComboBox::from_label("Depth").selected_text(self.depth.to_string()).show_ui(ui, |ui| {
+            for depth in 0..=Self::MAX_DEPTH {
+                ui.selectable_value(&mut self.depth, depth, depth.to_string());
+            }
+        }).response.on_hover_text("Depth 0 shows the four original arms.");
+        precision_slider(ui, &mut self.thickness, Self::THICKNESS, "Thickness", false, false);
+        precision_slider(ui, &mut self.spread, Self::SPREAD, "Spread", false, false);
+        precision_slider(ui, &mut self.twist, Self::TWIST, "Twist", false, true)
+            .on_hover_text("Twist the smaller copies around their arms. The direction alternates at each level.");
+        if ui.button("Reset Four-Branch Knot parameters").clicked() {
+            *self = Self::default();
+        }
+    }
+
+    fn values(self) -> [f32; 4] { [self.depth as f32, self.thickness, self.spread, self.twist] }
+
+    fn uniforms(self) -> [f32; 5] {
+        let (sine, cosine) = self.twist.to_radians().sin_cos();
+        [self.depth as f32, self.thickness, self.spread, cosine, sine]
+    }
+
+    fn from_preset(values: Option<&[f32]>) -> Self {
+        let Some([depth, thickness, spread, twist]) = values else { return Self::default(); };
+        Self {
+            depth: (*depth as u32).min(Self::MAX_DEPTH),
+            thickness: thickness.clamp(*Self::THICKNESS.start(), *Self::THICKNESS.end()),
+            spread: spread.clamp(*Self::SPREAD.start(), *Self::SPREAD.end()),
+            twist: twist.clamp(*Self::TWIST.start(), *Self::TWIST.end()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SierpinskiParameters {
+    depth: u32,
+}
+
+impl Default for SierpinskiParameters {
+    fn default() -> Self { Self { depth: 5 } }
+}
+
+impl SierpinskiParameters {
+    const MAX_DEPTH: u32 = MAX_FORMULA_DEPTH;
+
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        egui::ComboBox::from_label("Depth").selected_text(self.depth.to_string()).show_ui(ui, |ui| {
+            for depth in 0..=Self::MAX_DEPTH {
+                ui.selectable_value(&mut self.depth, depth, depth.to_string());
+            }
+        }).response.on_hover_text("Depth 0 shows the solid tetrahedron. Each level keeps four corner copies.");
+        if ui.button("Reset Sierpinski parameters").clicked() {
+            *self = Self::default();
+        }
+    }
+
+    fn from_preset(depth: Option<&f32>) -> Self {
+        Self { depth: depth.map_or(Self::default().depth, |depth| (*depth as u32).min(Self::MAX_DEPTH)) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OrbitDepths([u32; 4]);
+
+impl Default for OrbitDepths {
+    fn default() -> Self { Self([Self::DEFAULT; 4]) }
+}
+
+impl OrbitDepths {
+    const DEFAULT: u32 = 11;
+    const RANGE: std::ops::RangeInclusive<u32> = 2..=MAX_FORMULA_DEPTH;
+
+    fn index(formula: Fractal) -> Option<usize> {
+        match formula {
+            Fractal::Mandelbulb => Some(0),
+            Fractal::Mandelbox => Some(1),
+            Fractal::AmazingSurface => Some(2),
+            Fractal::PseudoKleinian => Some(3),
+            _ => None,
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, formula: Fractal) {
+        if let Some(index) = Self::index(formula) {
+            ui.add(egui::Slider::new(&mut self.0[index], Self::RANGE).text("Base depth"))
+                .on_hover_text("Sets the base detail. Close surfaces can use extra iterations.");
+        }
+    }
+
+    fn reset(&mut self, formula: Fractal) {
+        if let Some(index) = Self::index(formula) {
+            self.0[index] = Self::DEFAULT;
+        }
+    }
+
+    fn values(self) -> [f32; 4] { self.0.map(|depth| depth as f32) }
+
+    fn offsets(self) -> [f32; 4] { self.values().map(|depth| depth - Self::DEFAULT as f32) }
+
+    fn from_preset(values: Option<&[f32]>) -> Self {
+        let Some([bulb, mandelbox, surface, kleinian]) = values else { return Self::default(); };
+        Self([*bulb, *mandelbox, *surface, *kleinian].map(|depth|
+            (depth as u32).clamp(*Self::RANGE.start(), *Self::RANGE.end())))
     }
 }
 
@@ -602,18 +871,20 @@ impl Default for FoldParameters {
     fn default() -> Self {
         Self {
             kifs: [7.0, 2.45, 12.0, 1.0],
-            amazing_surface: [-1.8, 1.0, 0.5, 0.0],
-            pseudo_kleinian: [0.80, 1.0, 0.12, 0.08],
+            amazing_surface: [-2.5, 1.0, 0.65, 0.0],
+            pseudo_kleinian: [1.0, 0.88, 0.08, 0.16],
         }
     }
 }
 
 impl FoldParameters {
-    const KIFS_RANGES: [std::ops::RangeInclusive<f32>; 4] = [2.0..=14.0, 2.0..=3.5, -180.0..=180.0, 0.3..=1.5];
+    const LEGACY_SURFACE_DEFAULTS: [f32; 4] = [-1.8, 1.0, 0.5, 0.0];
+    const LEGACY_KLEINIAN_DEFAULTS: [f32; 4] = [0.80, 1.0, 0.12, 0.08];
+    const KIFS_RANGES: [std::ops::RangeInclusive<f32>; 4] = [2.0..=MAX_FORMULA_DEPTH as f32, 2.0..=3.5, -180.0..=180.0, 0.3..=1.5];
     const SURFACE_RANGES: [std::ops::RangeInclusive<f32>; 4] = [-3.0..=-1.2, 0.25..=2.0, 0.2..=0.95, -0.2..=0.2];
     const KLEINIAN_RANGES: [std::ops::RangeInclusive<f32>; 4] = [0.2..=1.5, 0.35..=2.0, 0.02..=0.4, -0.5..=0.5];
 
-    fn ui(&mut self, ui: &mut egui::Ui, formula: Fractal) {
+    fn ui(&mut self, ui: &mut egui::Ui, formula: Fractal) -> bool {
         let default = Self::default();
         match formula {
             Fractal::Kifs => {
@@ -621,19 +892,25 @@ impl FoldParameters {
                 precision_slider(ui, &mut self.kifs[1], Self::KIFS_RANGES[1].clone(), "Scale", false, false);
                 precision_slider(ui, &mut self.kifs[2], Self::KIFS_RANGES[2].clone(), "Fold rotation Y", false, true);
                 precision_slider(ui, &mut self.kifs[3], Self::KIFS_RANGES[3].clone(), "Seed radius", false, false);
-                if ui.button("Reset KIFS parameters").clicked() { self.kifs = default.kifs; }
+                let reset = ui.button("Reset KIFS parameters").clicked();
+                if reset { self.kifs = default.kifs; }
+                reset
             }
             Fractal::AmazingSurface => {
                 for (i, label) in ["Scale", "Fold limit", "Inner radius", "Scale variation"].into_iter().enumerate() {
                     precision_slider(ui, &mut self.amazing_surface[i], Self::SURFACE_RANGES[i].clone(), label, false, false);
                 }
-                if ui.button("Reset Amazing Surface parameters").clicked() { self.amazing_surface = default.amazing_surface; }
+                let reset = ui.button("Reset Amazing Surface parameters").clicked();
+                if reset { self.amazing_surface = default.amazing_surface; }
+                reset
             }
             Fractal::PseudoKleinian => {
                 for (i, label) in ["Fold limit", "Inversion radius", "Wall thickness", "Offset Z"].into_iter().enumerate() {
                     precision_slider(ui, &mut self.pseudo_kleinian[i], Self::KLEINIAN_RANGES[i].clone(), label, false, false);
                 }
-                if ui.button("Reset Pseudo-Kleinian parameters").clicked() { self.pseudo_kleinian = default.pseudo_kleinian; }
+                let reset = ui.button("Reset Pseudo-Kleinian parameters").clicked();
+                if reset { self.pseudo_kleinian = default.pseudo_kleinian; }
+                reset
             }
             _ => unreachable!("formula has a separate parameter panel"),
         }
@@ -654,7 +931,11 @@ impl FoldParameters {
     }
 
     fn from_preset(values: &[f32], kleinian: &[f32]) -> Self {
-        let mut settings = Self::default();
+        let mut settings = Self {
+            amazing_surface: Self::LEGACY_SURFACE_DEFAULTS,
+            pseudo_kleinian: Self::LEGACY_KLEINIAN_DEFAULTS,
+            ..Self::default()
+        };
         if let [kifs @ .., scale, fold, inner, variation] = values {
             if kifs.len() == 4 {
                 for (i, value) in kifs.iter().enumerate() {
@@ -692,7 +973,7 @@ impl Default for MengerParameters {
 }
 
 impl MengerParameters {
-    const DEPTH: std::ops::RangeInclusive<u32> = 1..=14;
+    const DEPTH: std::ops::RangeInclusive<u32> = 1..=MAX_FORMULA_DEPTH;
     const TUNNEL_WIDTH: std::ops::RangeInclusive<f32> = 0.6..=1.4;
     const ROTATION: std::ops::RangeInclusive<f32> = -360.0..=360.0;
 
@@ -758,18 +1039,19 @@ struct MandelboxParameters {
 
 impl Default for MandelboxParameters {
     fn default() -> Self {
-        Self { scale: -1.5, fold_limit: 1.0, inner_radius: 0.5, outer_radius: 1.0 }
+        Self { scale: -1.8, fold_limit: 1.0, inner_radius: 0.5, outer_radius: 1.0 }
     }
 }
 
 impl MandelboxParameters {
+    const LEGACY_SCALE: f32 = -1.5;
     const SCALE: std::ops::RangeInclusive<f32> = -2.5..=-1.15;
     const FOLD_LIMIT: std::ops::RangeInclusive<f32> = 0.25..=2.0;
     const MIN_INNER_RADIUS: f32 = 0.2;
     const MIN_OUTER_RADIUS: f32 = 0.5;
     const MAX_OUTER_RADIUS: f32 = 1.5;
 
-    fn ui(&mut self, ui: &mut egui::Ui) {
+    fn ui(&mut self, ui: &mut egui::Ui) -> bool {
         precision_slider(ui, &mut self.scale, Self::SCALE, "Scale", false, false)
             .on_hover_text("Changes the size ratio between successive levels of the fractal.");
         precision_slider(ui, &mut self.fold_limit, Self::FOLD_LIMIT, "Box fold limit", false, false)
@@ -778,9 +1060,11 @@ impl MandelboxParameters {
             .on_hover_text("Sets the inner boundary of the sphere fold.");
         precision_slider(ui, &mut self.outer_radius, self.inner_radius.max(Self::MIN_OUTER_RADIUS)..=Self::MAX_OUTER_RADIUS, "Outer radius", false, false)
             .on_hover_text("Sets the outer boundary of the sphere fold.");
-        if ui.button("Reset Mandelbox parameters").clicked() {
+        let reset = ui.button("Reset Mandelbox parameters").clicked();
+        if reset {
             *self = Self::default();
         }
+        reset
     }
 
     fn values(&self) -> [f32; 4] {
@@ -795,7 +1079,7 @@ impl MandelboxParameters {
 
     fn from_preset(values: &[f32]) -> Self {
         let [scale, fold_limit, inner_radius, outer_radius] = values else {
-            return Self::default();
+            return Self { scale: Self::LEGACY_SCALE, ..Self::default() };
         };
         let outer_radius = outer_radius.clamp(Self::MIN_OUTER_RADIUS, Self::MAX_OUTER_RADIUS);
         Self {
@@ -851,6 +1135,9 @@ struct MutationStage {
     bulb_power: f32,
     menger_parameters: MengerParameters,
     fold_parameters: FoldParameters,
+    sierpinski: SierpinskiParameters,
+    four_branch: FourBranchParameters,
+    orbit_depths: OrbitDepths,
 }
 
 impl Default for MutationStage {
@@ -862,6 +1149,9 @@ impl Default for MutationStage {
             bulb_power: 8.0,
             menger_parameters: MengerParameters::default(),
             fold_parameters: FoldParameters::default(),
+            sierpinski: SierpinskiParameters::default(),
+            four_branch: FourBranchParameters::default(),
+            orbit_depths: OrbitDepths::default(),
         }
     }
 }
@@ -888,18 +1178,26 @@ impl MutationStage {
         if let Some(formula) = selected {
             precision_slider(ui, &mut self.weight, 0.0..=1.0, "Weight", false, false)
                 .on_hover_text("Contribution relative to the base formula and the other active mutations.");
-            ui.collapsing("Mutation parameters", |ui| match formula {
-                Fractal::Mandelbox => self.box_parameters.ui(ui),
-                Fractal::Mandelbulb => {
-                    precision_slider(ui, &mut self.bulb_power, 2.0..=23.0, "Power", false, false);
-                    self.bulb_parameters.ui(ui);
-                    if ui.button("Reset mutation parameters").clicked() {
-                        self.bulb_power = 8.0;
-                        self.bulb_parameters = MandelbulbParameters::default();
+            ui.collapsing("Mutation parameters", |ui| {
+                self.orbit_depths.ui(ui, formula);
+                let reset = match formula {
+                    Fractal::Mandelbox => self.box_parameters.ui(ui),
+                    Fractal::Mandelbulb => {
+                        precision_slider(ui, &mut self.bulb_power, 2.0..=23.0, "Power", false, false);
+                        self.bulb_parameters.ui(ui);
+                        let reset = ui.button("Reset mutation parameters").clicked();
+                        if reset {
+                            self.bulb_power = 8.0;
+                            self.bulb_parameters = MandelbulbParameters::default();
+                        }
+                        reset
                     }
-                }
-                Fractal::Menger => self.menger_parameters.ui(ui),
-                Fractal::Kifs | Fractal::AmazingSurface | Fractal::PseudoKleinian => self.fold_parameters.ui(ui, formula),
+                    Fractal::Menger => { self.menger_parameters.ui(ui); false }
+                    Fractal::Sierpinski => { self.sierpinski.ui(ui); false }
+                    Fractal::FourBranch => { self.four_branch.ui(ui); false }
+                    Fractal::Kifs | Fractal::AmazingSurface | Fractal::PseudoKleinian => self.fold_parameters.ui(ui, formula),
+                };
+                if reset { self.orbit_depths.reset(formula); }
             });
         }
     }
@@ -917,6 +1215,9 @@ impl MutationStage {
         let mut data = [0.0; EXTRA_MUTATION_UNIFORMS];
         data[0] = coefficient;
         data[1] = formula.value();
+        if let Some(index) = OrbitDepths::index(formula) {
+            data[2] = self.orbit_depths.offsets()[index];
+        }
         let folds = self.fold_parameters.uniforms();
         let parameters = match formula {
             Fractal::Mandelbox => self.box_parameters.uniforms(),
@@ -931,6 +1232,11 @@ impl MutationStage {
             Fractal::Kifs => folds[0..4].try_into().unwrap(),
             Fractal::AmazingSurface => folds[4..8].try_into().unwrap(),
             Fractal::PseudoKleinian => folds[8..12].try_into().unwrap(),
+            Fractal::Sierpinski => [self.sierpinski.depth as f32, 0.0, 0.0, 0.0],
+            Fractal::FourBranch => {
+                data[4..9].copy_from_slice(&self.four_branch.uniforms());
+                return data;
+            }
         };
         data[4..8].copy_from_slice(&parameters);
         data
@@ -955,7 +1261,18 @@ impl MutationStage {
             bulb_power: power.clamp(2.0, 23.0),
             menger_parameters: MengerParameters::from_preset(&values[11..]),
             fold_parameters: FoldParameters::default(),
+            sierpinski: SierpinskiParameters::default(),
+            four_branch: FourBranchParameters::default(),
+            orbit_depths: OrbitDepths::default(),
         }
+    }
+}
+
+fn color_edit_button(ui: &mut egui::Ui, color: &mut [f32; 3]) {
+    // The RGB widget converts through HSV even when it only paints the swatch.
+    let mut edited = *color;
+    if ui.color_edit_button_rgb(&mut edited).changed() {
+        *color = edited;
     }
 }
 
@@ -1032,6 +1349,19 @@ impl Camera {
             pitch: -(1.0 / 2.0_f32.sqrt()).atan(),
             ..Self::default()
         }
+    }
+
+    fn framed_view(fractal: Fractal) -> Self {
+        let position: [f32; 3] = match fractal {
+            Fractal::Mandelbulb => [4.0; 3],
+            Fractal::Mandelbox => [12.0; 3],
+            Fractal::AmazingSurface => [2.8, 1.0, 4.9],
+            Fractal::PseudoKleinian => [1.1, 0.6, 3.4],
+            Fractal::FourBranch => [2.8, 1.8, 4.2],
+            _ => return Self::starting_view(),
+        };
+        let [x, y, z] = position;
+        Self { position, yaw: (-x).atan2(z), pitch: (-y).atan2(x.hypot(z)), ..Self::default() }
     }
 
     fn view_roll(&self) -> f32 {
@@ -1111,10 +1441,18 @@ fn text_edit_is_focused(ctx: &egui::Context) -> bool {
 struct OutputSettings {
     width: u32, height: u32, samples: u32,
     denoise: Option<denoise::Backend>, viewport_denoise: Option<denoise::Backend>,
+    viewport_denoise_interval: u32,
+    intelligent_sampling: bool,
+    viewport_noise: noise_sampling::Settings,
+    render_noise: noise_sampling::Settings,
+    time_limit: f32,
     status: String, progress: f32,
 }
 impl Default for OutputSettings { fn default() -> Self { Self {
-    width: 1920, height: 1080, samples: 16, denoise: None, viewport_denoise: None, status: String::new(), progress: 0.0,
+    width: 1920, height: 1080, samples: 16, denoise: None, viewport_denoise: None,
+    viewport_denoise_interval: viewport_denoise::DEFAULT_INTERVAL, intelligent_sampling: false,
+    viewport_noise: noise_sampling::Settings::new(0.1), render_noise: noise_sampling::Settings::new(0.01),
+    time_limit: 0.0, status: String::new(), progress: 0.0,
 } } }
 struct RenderJob { receiver: std::sync::mpsc::Receiver<export::Update>, cancel: Arc<std::sync::atomic::AtomicBool> }
 
@@ -1196,12 +1534,28 @@ impl ControlsTab {
         response.on_hover_text(self.label())
     }
 }
-struct App { hdri: Option<hdri::Panorama>, hdri_input: String, hdri_status: String, about: about::About, startup: startup::Startup, event_proxy: Option<winit::event_loop::EventLoopProxy<startup::Event>>, window: Option<Arc<Window>>, renderer: Option<Renderer>, camera: Camera, keys: HashSet<KeyCode>, looking: bool, last_frame: Instant, slice: Option<f32>, power: f32, fractal: Fractal, mutation: MutationStage, extra_mutations: Vec<MutationStage>, base_weight: f32, menger_parameters: MengerParameters, mandelbox_parameters: MandelboxParameters, mandelbulb_parameters: MandelbulbParameters, fold_parameters: FoldParameters, diagnostic: bool, material: u32, material_settings: [f32; 5], material_finish: SurfaceFinish, custom_finish: SurfaceFinish, matcap: MatcapMaterial, ao: bool, ao_strength: f32, ao_radius: f32, exposure: f32, contrast: f32, normal_smoothing: f32, quality: f32, distant_filter: f32, lighting: Lighting, still_samples: u32, moving_samples: u32, moving_bounces: u32, progress_samples: u32, progress_tile: u32, refine_tiles_per_frame: u32, idle_deadline: Option<Instant>, idle_ready: bool, last_scene: Vec<f32>, egui_ctx: egui::Context, egui_state: Option<egui_winit::State>, preset_status: String, presets: preset_gallery::Gallery, capture_slot: Option<u64>, output: OutputSettings, render_job: Option<RenderJob>, start_export: bool, left_open: bool, controls_tab: ControlsTab, right_open: bool, effects: CameraEffects, background_color: [f32; 3], show_frame: bool, frame: Option<egui::Rect>, picking_focus: bool, focus_point: Option<[f32; 2]>, focus_status: String, history: history::History, history_actions: Vec<history::Action>, modifiers: winit::keyboard::ModifiersState }
+struct App { still_timing: StillTiming, pixel_sampling: pixel_sampling::PixelSampling, navigation_sample: u32, viewport_was_interacting: bool, adaptive_viewport: adaptive_viewport::AdaptiveViewport, hdri: Option<hdri::Panorama>, hdri_input: String, hdri_status: String, about: about::About, startup: startup::Startup, event_proxy: Option<winit::event_loop::EventLoopProxy<startup::Event>>, window: Option<Arc<Window>>, renderer: Option<Renderer>, camera: Camera, keys: HashSet<KeyCode>, looking: bool, last_frame: Instant, slice: Option<f32>, power: f32, fractal: Fractal, mutation: MutationStage, extra_mutations: Vec<MutationStage>, base_weight: f32, menger_parameters: MengerParameters, mandelbox_parameters: MandelboxParameters, mandelbulb_parameters: MandelbulbParameters, fold_parameters: FoldParameters, sierpinski: SierpinskiParameters, four_branch: FourBranchParameters, orbit_depths: OrbitDepths, diagnostic: bool, material: u32, material_settings: [f32; 5], material_finish: SurfaceFinish, custom_finish: SurfaceFinish, matcap: MatcapMaterial, ao: bool, ao_strength: f32, ao_radius: f32, exposure: f32, contrast: f32, normal_smoothing: f32, quality: f32, distant_filter: f32, lighting: Lighting, still_samples: u32, moving_samples: u32, moving_bounces: u32, progress_samples: u32, progress_tile: u32, refine_tiles_per_frame: u32, idle_deadline: Option<Instant>, idle_ready: bool, last_scene: Vec<f32>, egui_ctx: egui::Context, egui_state: Option<egui_winit::State>, preset_status: String, presets: preset_gallery::Gallery, capture_slot: Option<u64>, output: OutputSettings, render_job: Option<RenderJob>, start_export: bool, left_open: bool, controls_tab: ControlsTab, right_open: bool, effects: CameraEffects, background_color: [f32; 3], show_frame: bool, frame: Option<egui::Rect>, picking_focus: bool, focus_point: Option<[f32; 2]>, focus_status: String, history: history::History, history_actions: Vec<history::Action>, modifiers: winit::keyboard::ModifiersState }
 impl Default for App {
     fn default() -> Self {
         let camera = Camera::starting_view();
         let effects = CameraEffects { focal: STARTING_FOCAL_MM, ..CameraEffects::default() };
-        Self { hdri: None, hdri_input: String::new(), hdri_status: String::new(), about: about::About::default(), startup: startup::Startup::default(), event_proxy: None, window: None, renderer: None, camera, keys: HashSet::new(), looking: false, last_frame: Instant::now(), slice: None, power: 8.0, fractal: Fractal::default(), mutation: MutationStage::default(), extra_mutations: Vec::new(), base_weight: 1.0, menger_parameters: MengerParameters::default(), mandelbox_parameters: MandelboxParameters::default(), mandelbulb_parameters: MandelbulbParameters::default(), fold_parameters: FoldParameters::default(), diagnostic: false, material: STANDARD_MATERIAL, material_settings: DIFFUSE_DEFAULTS, material_finish: SurfaceFinish::default(), custom_finish: SurfaceFinish::default(), matcap: MatcapMaterial::default(), ao: false, ao_strength: 0.5, ao_radius: 0.048, exposure: 0.0, contrast: 1.0, normal_smoothing: 0.002, quality: 1.0, distant_filter: 2.0, lighting: Lighting::default(), still_samples: DEFAULT_VIEWPORT_SAMPLES, moving_samples: 1, moving_bounces: 1, progress_samples: 0, progress_tile: 0, refine_tiles_per_frame: 1, idle_deadline: None, idle_ready: false, last_scene: Vec::new(), egui_ctx: egui::Context::default(), egui_state: None, preset_status: String::new(), presets: preset_gallery::Gallery::default(), capture_slot: None, output: OutputSettings::default(), render_job: None, start_export: false, left_open: true, controls_tab: ControlsTab::default(), right_open: true, effects, background_color: DEFAULT_BACKGROUND, show_frame: true, frame: None, picking_focus: false, focus_point: None, focus_status: String::new(), history: history::History::default(), history_actions: Vec::new(), modifiers: winit::keyboard::ModifiersState::empty() }
+        Self { still_timing: StillTiming::default(), pixel_sampling: pixel_sampling::PixelSampling::default(), navigation_sample: 0, viewport_was_interacting: false, adaptive_viewport: adaptive_viewport::AdaptiveViewport::default(), hdri: None, hdri_input: String::new(), hdri_status: String::new(), about: about::About::default(), startup: startup::Startup::default(), event_proxy: None, window: None, renderer: None, camera, keys: HashSet::new(), looking: false, last_frame: Instant::now(), slice: None, power: 8.0, fractal: Fractal::default(), mutation: MutationStage::default(), extra_mutations: Vec::new(), base_weight: 1.0, menger_parameters: MengerParameters::default(), mandelbox_parameters: MandelboxParameters::default(), mandelbulb_parameters: MandelbulbParameters::default(), fold_parameters: FoldParameters::default(), sierpinski: SierpinskiParameters::default(), four_branch: FourBranchParameters::default(), orbit_depths: OrbitDepths::default(), diagnostic: false, material: MATCAP_MATERIAL, material_settings: DIFFUSE_DEFAULTS, material_finish: SurfaceFinish::default(), custom_finish: SurfaceFinish::default(), matcap: MatcapMaterial::default(), ao: false, ao_strength: 0.5, ao_radius: 0.048, exposure: 0.0, contrast: 1.0, normal_smoothing: 0.002, quality: 1.0, distant_filter: 2.0, lighting: Lighting::default(), still_samples: DEFAULT_VIEWPORT_SAMPLES, moving_samples: 1, moving_bounces: 1, progress_samples: 0, progress_tile: 0, refine_tiles_per_frame: 1, idle_deadline: None, idle_ready: false, last_scene: Vec::new(), egui_ctx: egui::Context::default(), egui_state: None, preset_status: String::new(), presets: preset_gallery::Gallery::default(), capture_slot: None, output: OutputSettings::default(), render_job: None, start_export: false, left_open: true, controls_tab: ControlsTab::default(), right_open: true, effects, background_color: DEFAULT_BACKGROUND, show_frame: true, frame: None, picking_focus: false, focus_point: None, focus_status: String::new(), history: history::History::default(), history_actions: Vec::new(), modifiers: winit::keyboard::ModifiersState::empty() }
+    }
+}
+
+#[derive(Default)]
+struct StillTiming {
+    started: Option<Instant>,
+    pending: Option<std::sync::mpsc::Receiver<Instant>>,
+    completed: Option<Duration>,
+}
+
+impl StillTiming {
+    fn finish(&mut self, queue: &wgpu::Queue) {
+        if self.started.is_none() || self.pending.is_some() || self.completed.is_some() { return; }
+        let (send, pending) = std::sync::mpsc::channel();
+        queue.on_submitted_work_done(move || { let _ = send.send(Instant::now()); });
+        self.pending = Some(pending);
     }
 }
 impl App {
@@ -1223,6 +1577,46 @@ impl App {
         format!("{APP_NAME} - {}", self.fractal.name())
     }
 
+    fn viewport_scene(&self, size: winit::dpi::PhysicalSize<u32>, projection: [f32; 4]) -> Vec<f32> {
+        let mut scene = vec![self.camera.position[0], self.camera.position[1], self.camera.position[2], self.camera.yaw, self.camera.pitch, self.camera.roll, self.slice.is_some() as u8 as f32, self.slice.unwrap_or(0.0), self.power, self.fractal.value(), self.diagnostic as u8 as f32, self.material as f32, self.ao as u8 as f32, self.ao_strength, self.ao_radius, self.exposure, self.normal_smoothing, self.quality, self.distant_filter, self.lighting.color[0], self.lighting.color[1], self.lighting.color[2], self.lighting.roughness, self.lighting.metallic, self.lighting.light_color[0], self.lighting.light_color[1], self.lighting.light_color[2], self.lighting.azimuth, self.lighting.elevation, self.lighting.intensity, size.width as f32, size.height as f32];
+        scene.extend(self.lighting.environment_color);
+        scene.extend([self.lighting.environment_strength, self.lighting.angular_radius]);
+        scene.extend(self.lighting.path_preset());
+        scene.extend([flag(self.lighting.enabled), flag(self.lighting.shadows)]);
+        scene.extend(self.effects.preset());
+        scene.extend(self.effects.bokeh());
+        scene.extend(self.material_settings);
+        scene.extend(self.material_finish.values());
+        scene.extend(self.custom_finish.values());
+        scene.extend(self.matcap.values());
+        scene.push(self.camera.look_roll);
+        scene.extend(self.mandelbox_parameters.values());
+        scene.extend(self.mandelbulb_parameters.values());
+        scene.extend(self.menger_parameters.values());
+        scene.extend(self.background_color);
+        scene.extend(self.mutation.values());
+        scene.extend(self.fold_parameters.values());
+        scene.extend(self.mutation.fold_parameters.values());
+        scene.extend([self.sierpinski.depth as f32, self.mutation.sierpinski.depth as f32]);
+        scene.extend(self.orbit_depths.values());
+        scene.extend(self.mutation.orbit_depths.values());
+        scene.extend(self.four_branch.values());
+        scene.extend(self.mutation.four_branch.values());
+        for stage in &self.extra_mutations {
+            scene.extend(stage.stacked_preset_values());
+            scene.push(stage.sierpinski.depth as f32);
+            scene.extend(stage.orbit_depths.values());
+            scene.extend(stage.four_branch.values());
+        }
+        scene.push(self.base_weight);
+        scene.extend(projection);
+        scene.push(flag(self.adaptive_viewport.enabled));
+        scene.push(self.pixel_sampling.uniform());
+        scene.push(self.adaptive_viewport.budget_ms as f32);
+        scene.extend([self.moving_samples as f32, self.moving_bounces as f32]);
+        scene
+    }
+
     fn still_sample_target(&self) -> u32 {
         if self.diagnostic { 1 }
         else { self.still_samples }
@@ -1230,7 +1624,8 @@ impl App {
 
     fn ui(&mut self, ctx: &egui::Context) {
         if self.right_open {
-            egui::SidePanel::right("render_output").default_width(255.0).resizable(true).show(ctx, |ui| {
+            egui::SidePanel::right("render_output").default_width(255.0).min_width(255.0).resizable(true).show(ctx, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.heading("Render");
                     if ui.small_button("▶").on_hover_text("Hide render panel").clicked() { self.right_open = false; }
@@ -1246,7 +1641,14 @@ impl App {
                 }
                 if !self.output.status.is_empty() { ui.label(&self.output.status); }
                 ui.separator();
-                egui::ScrollArea::vertical().id_salt("render_settings").auto_shrink([false, false]).show(ui, |ui| {
+                let body = ui.available_rect_before_wrap();
+                let settings_rect = body.shrink2(egui::vec2(4.0, 0.0));
+                let mut settings_ui = ui.new_child(egui::UiBuilder::new().id_salt("render_body").max_rect(settings_rect));
+                // Hovered widgets can paint outside their layout rectangle, inside the panel gutter.
+                settings_ui.set_clip_rect(ui.clip_rect().intersect(body));
+                ui.allocate_space(body.size());
+                egui::ScrollArea::vertical().id_salt("render_settings").auto_shrink([false, false]).show(&mut settings_ui, |ui| {
+                    ui.spacing_mut().slider_width = 64.0;
                     self.render_settings_ui(ui);
                 });
             });
@@ -1264,6 +1666,7 @@ impl App {
                 .min_width(CONTROLS_MIN_WIDTH)
                 .resizable(true)
                 .show(ctx, |ui| {
+                    ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
                         if ui.small_button("◀").on_hover_text("Hide controls").clicked() {
                             self.left_open = false;
@@ -1281,7 +1684,12 @@ impl App {
                         }
                     });
                     ui.separator();
-                    ui.horizontal_top(|ui| {
+                    // A tab's contents must not resize the panel and change the camera projection.
+                    let body = ui.available_rect_before_wrap();
+                    let mut tab_ui = ui.new_child(egui::UiBuilder::new().id_salt("tab_body").max_rect(body));
+                    tab_ui.set_clip_rect(ui.clip_rect().intersect(body));
+                    ui.allocate_space(body.size());
+                    tab_ui.horizontal_top(|ui| {
                         ui.allocate_ui_with_layout(egui::vec2(27.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                             for tab in ControlsTab::ALL {
                                 if tab.button(ui, self.controls_tab == tab).clicked() {
@@ -1335,31 +1743,57 @@ impl App {
         }
     }
     fn formula_ui(&mut self, ui: &mut egui::Ui) {
+        let mut selected = self.fractal;
         egui::ComboBox::from_label("Fractal")
             .selected_text(self.fractal.name())
             .show_ui(ui, |ui| {
                 for fractal in Fractal::ALL {
-                    ui.selectable_value(&mut self.fractal, fractal, fractal.name());
+                    ui.selectable_value(&mut selected, fractal, fractal.name());
                 }
             });
-        match self.fractal {
+        if selected != self.fractal {
+            self.select_fractal(selected);
+        }
+        self.orbit_depths.ui(ui, self.fractal);
+        let reset = match self.fractal {
             Fractal::Mandelbulb => {
                 precision_slider(ui, &mut self.power, 2.0..=23.0, "Power", false, false);
                 self.mandelbulb_parameters.ui(ui);
-                if ui.button("Reset Mandelbulb parameters").clicked() {
+                let reset = ui.button("Reset Mandelbulb parameters").clicked();
+                if reset {
                     self.power = 8.0;
                     self.mandelbulb_parameters = MandelbulbParameters::default();
                 }
                 let mut enabled = self.slice.is_some();
                 if ui.checkbox(&mut enabled, "Section").changed() { self.slice = enabled.then_some(0.0); }
                 if let Some(z) = &mut self.slice { precision_slider(ui, z, -2.0..=2.0, "Section Z", false, false); }
+                reset
             }
             Fractal::Mandelbox => self.mandelbox_parameters.ui(ui),
-            Fractal::Menger => self.menger_parameters.ui(ui),
+            Fractal::Menger => { self.menger_parameters.ui(ui); false }
+            Fractal::Sierpinski => { self.sierpinski.ui(ui); false }
+            Fractal::FourBranch => { self.four_branch.ui(ui); false }
             Fractal::Kifs | Fractal::AmazingSurface | Fractal::PseudoKleinian => self.fold_parameters.ui(ui, self.fractal),
-        }
+        };
+        if reset { self.orbit_depths.reset(self.fractal); }
         ui.separator();
         self.mutations_ui(ui);
+    }
+
+    fn select_fractal(&mut self, fractal: Fractal) {
+        let starting = Camera::framed_view(self.fractal);
+        let at_starting_view = self.camera.position == starting.position
+            && self.camera.yaw == starting.yaw && self.camera.pitch == starting.pitch
+            && self.camera.view_roll() == 0.0 && self.effects.focal == STARTING_FOCAL_MM;
+        self.fractal = fractal;
+        if at_starting_view {
+            self.reset_framing();
+        }
+    }
+
+    fn reset_framing(&mut self) {
+        self.camera = Camera { speed: self.camera.speed, ..Camera::framed_view(self.fractal) };
+        self.effects.set_focal(STARTING_FOCAL_MM);
     }
 
     fn mutations_ui(&mut self, ui: &mut egui::Ui) {
@@ -1474,7 +1908,7 @@ impl App {
             precision_slider(ui, &mut finish.coat_roughness, 0.05..=1.0, "Roughness", false, false);
         });
         egui::CollapsingHeader::new("Emission").show(ui, |ui| {
-            ui.horizontal(|ui| { ui.label("Color"); ui.color_edit_button_rgb(&mut finish.emission_color); });
+            ui.horizontal(|ui| { ui.label("Color"); color_edit_button(ui, &mut finish.emission_color); });
             precision_slider(ui, &mut finish.emission_strength, 0.0..=20.0, "Strength", false, false);
         });
     }
@@ -1490,7 +1924,7 @@ impl App {
     }
 
     fn base_color_ui(ui: &mut egui::Ui, color: &mut [f32; 3]) {
-        ui.horizontal(|ui| { ui.label("Base color"); ui.color_edit_button_rgb(color); });
+        ui.horizontal(|ui| { ui.label("Base color"); color_edit_button(ui, color); });
     }
 
     fn color_ui(&mut self, ui: &mut egui::Ui) {
@@ -1512,55 +1946,67 @@ impl App {
             });
         ui.separator();
         ui.heading("Sampling");
-        ui.add_enabled_ui(!self.diagnostic, |ui| {
-            egui::ComboBox::from_label("Viewport (moving)").selected_text(self.moving_samples.to_string()).show_ui(ui, |ui| {
-                for count in MOVING_SAMPLE_COUNTS {
-                    ui.selectable_value(&mut self.moving_samples, count, count.to_string());
+        egui::ComboBox::from_label("Pixel sampling")
+            .selected_text(self.pixel_sampling.label())
+            .show_ui(ui, |ui| {
+                for mode in pixel_sampling::PixelSampling::ALL {
+                    ui.selectable_value(&mut self.pixel_sampling, mode, mode.label());
                 }
-            }).response.on_hover_text("Samples per frame while moving or looking around. Higher values can slow navigation.");
+            }).response.on_hover_text("Subpixel sampling for the viewport and PNG renders.");
+        ui.heading("Viewport");
+        ui.add_enabled_ui(!self.diagnostic && !self.section_active(), |ui| {
+            Self::noise_controls(ui, "viewport_noise", &mut self.output.viewport_noise, &mut self.still_samples);
+            ui.add_enabled(!self.output.viewport_noise.enabled, egui::Checkbox::new(
+                &mut self.output.intelligent_sampling, "Intelligent ray sampling",
+            )).on_hover_text("Redistributes rays during still refinement. Available when Noise Threshold is off.");
         });
-        ui.add_enabled_ui(!self.diagnostic, |ui| {
-            egui::ComboBox::from_label("Viewport (still)").selected_text(self.still_samples.to_string()).show_ui(ui, |ui| {
-                for count in SAMPLE_COUNTS {
-                    ui.selectable_value(&mut self.still_samples, count, count.to_string());
-                }
-            }).response.on_hover_text("Samples accumulated while the camera is still.");
-        });
-        if self.path_traced_preview() || self.ray_traced_ao_preview() {
-            let target = self.still_sample_target();
-            let samples = if self.idle_ready { self.progress_samples.min(target) } else { 0 };
-            ui.small(format!("Viewport: {samples} / {target} samples"));
-        }
         ui.add_enabled_ui(!self.diagnostic && !self.section_active(), |ui| {
             denoise::selector(ui, "Denoise viewport", &mut self.output.viewport_denoise);
+            ui.add_enabled(self.output.viewport_denoise.is_some(),
+                egui::Slider::new(&mut self.output.viewport_denoise_interval, 1..=512)
+                    .text("Denoise Interval").suffix(" spp").step_by(1.0).drag_value_speed(1.0).smart_aim(false))
+                .on_hover_text("Filters the first sample, then at fixed multiples of this interval, and at the final sample.");
         });
-        if let Some(renderer) = &self.renderer {
-            if let Some(error) = &renderer.viewport_denoise.error {
-                ui.small(error);
-            } else if let Some(backend) = renderer.viewport_denoise.busy() {
-                ui.small(format!("Denoising viewport on {}…", backend.label()));
+        egui::CollapsingHeader::new("Navigation").default_open(true).show(ui, |ui| {
+            let adaptive = &mut self.adaptive_viewport;
+            let toggled = ui.checkbox(&mut adaptive.enabled, "Adaptive resolution").changed();
+            let budget_changed = ui.add_enabled(adaptive.enabled,
+                egui::Slider::new(&mut adaptive.budget_ms, 8..=66).text("Pass budget").suffix(" ms"))
+                .on_hover_text("Target time for a complete navigation preview. The visor starts at quarter resolution per axis.").changed();
+            if toggled || budget_changed { adaptive.restart(); }
+            ui.add_enabled_ui(!self.diagnostic, |ui| {
+                egui::ComboBox::from_label("Moving Samples").selected_text(self.moving_samples.to_string()).show_ui(ui, |ui| {
+                    for count in MOVING_SAMPLE_COUNTS {
+                        ui.selectable_value(&mut self.moving_samples, count, count.to_string());
+                    }
+                }).response.on_hover_text("Samples per frame while moving or looking around. Higher values can slow navigation.");
+            });
+            if self.lighting.path_traced {
+                ui.add_enabled_ui(self.path_traced_preview(), |ui| {
+                    ui.add(egui::Slider::new(&mut self.moving_bounces, 1..=8).text("Moving bounces"))
+                        .on_hover_text("Bounces while moving or looking around. Higher values can slow navigation.");
+                });
             }
-        }
+        });
+        ui.separator();
+        ui.heading("Render PNG");
         ui.add_enabled_ui(self.render_job.is_none(), |ui| {
-            egui::ComboBox::from_label("PNG render").selected_text(self.output.samples.to_string()).show_ui(ui, |ui| {
-                for count in SAMPLE_COUNTS {
-                    ui.selectable_value(&mut self.output.samples, count, count.to_string());
-                }
+            Self::noise_controls(ui, "render_noise", &mut self.output.render_noise, &mut self.output.samples);
+            ui.horizontal(|ui| {
+                ui.label("Time Limit");
+                ui.add(egui::DragValue::new(&mut self.output.time_limit).range(0.0..=86400.0).speed(0.1).suffix(" s"))
+                    .on_hover_text("Time budget for tracing. 0 is unlimited. Finishes at least one pass over every tile before denoising and saving.");
             });
             denoise::selector(ui, "Denoise PNG", &mut self.output.denoise);
         });
         if !self.section_active() && self.effects.dof_enabled && self.effects.aperture > 0.0 && self.output.samples == 1 {
-            ui.small("Choose 4 or more PNG samples for depth of field.");
+            ui.small("Use 4 or more PNG samples for smoother depth of field.");
         }
         if self.lighting.path_traced {
             ui.separator();
             ui.heading("Light Paths");
             ui.add(egui::Slider::new(&mut self.lighting.bounces, 1..=8).text("Max bounces"))
                 .on_hover_text("Bounces for the still viewport and PNG. 1 lights the visible surface. Higher values add indirect light.");
-            ui.add_enabled_ui(self.path_traced_preview(), |ui| {
-                ui.add(egui::Slider::new(&mut self.moving_bounces, 1..=8).text("Moving bounces"))
-                    .on_hover_text("Bounces while moving or looking around. Higher values can slow navigation.");
-            });
         }
         ui.separator();
         ui.heading("Output");
@@ -1578,6 +2024,90 @@ impl App {
         });
         ui.checkbox(&mut self.show_frame, "Show render frame");
         ui.small("Images are saved in the renders folder.");
+
+        ui.separator();
+        egui::CollapsingHeader::new("Viewport diagnostics").show(ui, |ui| {
+            self.viewport_diagnostics_ui(ui);
+        });
+    }
+
+    fn noise_controls(ui: &mut egui::Ui, id: &'static str, settings: &mut noise_sampling::Settings, max_samples: &mut u32) {
+        egui::Grid::new(id).show(ui, |ui| {
+            ui.checkbox(&mut settings.enabled, "Noise Threshold")
+                .on_hover_text("Stop sampling pixels when their estimated noise falls below the threshold.");
+            ui.add_enabled(settings.enabled, egui::DragValue::new(&mut settings.threshold)
+                .range(0.0..=1.0).speed(0.001).fixed_decimals(4))
+                .on_hover_text("Lower values refine the image longer. 0 chooses a threshold based on Max Samples.");
+            ui.end_row();
+            ui.label(if settings.enabled { "Max Samples" } else { "Samples" });
+            ui.add(egui::DragValue::new(max_samples).range(1..=noise_sampling::MAX_SAMPLES));
+            ui.end_row();
+            if settings.enabled {
+                ui.label("Min Samples");
+                ui.add(egui::DragValue::new(&mut settings.min_samples).range(0..=*max_samples))
+                    .on_hover_text("Minimum samples before the convergence check. 0 chooses a value based on Noise Threshold.");
+                ui.end_row();
+            }
+        });
+    }
+
+    fn viewport_diagnostics_ui(&self, ui: &mut egui::Ui) {
+        // Keep the scroll area stable when measurements appear or disappear.
+        let row_height = ui.text_style_height(&egui::TextStyle::Small) + ui.spacing().item_spacing.y;
+        ui.set_min_height(12.0 * row_height);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        let still_time = self.still_timing.completed.map_or_else(|| "—".to_string(), |elapsed| {
+            format!("{:.2} s", elapsed.as_secs_f64())
+        });
+        ui.small(format!("Still time: {still_time}"))
+            .on_hover_text("Elapsed time from the first still pass through the final viewport frame, including denoising when enabled.");
+        let adaptive = &self.adaptive_viewport;
+        if adaptive.enabled {
+            if let Some(stats) = &adaptive.last {
+                let [width, height] = stats.size;
+                let source = if stats.gpu { "GPU" } else { "completion" };
+                ui.small(format!("{width} × {height} · {:.1} ms {source} · {:.2} M primary rays/s",
+                    stats.ms, stats.rays as f64 / (stats.ms * 1000.0)));
+                if let Some(valid) = stats.valid_fraction {
+                    ui.small(format!("Estimated valid: {:.1}% · {:.2} M rays/s",
+                        valid * 100.0, valid * stats.rays as f64 / (stats.ms * 1000.0)));
+                }
+                if let Some(metrics) = stats.metrics_ms {
+                    ui.small(format!("{:.1} ms completion · {metrics:.3} ms GPU metrics", stats.completion_ms));
+                }
+            }
+        }
+        if self.path_traced_preview() || self.ray_traced_ao_preview() || self.environment_texture().is_some()
+            || self.output.viewport_denoise.is_some() || self.output.viewport_noise.enabled
+        {
+            let target = self.still_sample_target();
+            let samples = if self.idle_ready { self.progress_samples.min(target) } else { 0 };
+            ui.small(format!("Completed: {samples} / {target} passes"))
+                .on_hover_text("A pass can trace different numbers of rays per pixel with Noise Threshold or Intelligent ray sampling.");
+        }
+        if let Some(renderer) = &self.renderer {
+            if let Some(remaining) = renderer.noise_remaining {
+                if remaining == 0 { ui.small("Noise threshold reached"); }
+                else if let Some(tiles) = &renderer.noise_tiles {
+                    ui.small(format!("{remaining} active pixels in {} tiles", tiles.len()));
+                }
+            }
+            if self.output.intelligent_sampling && self.still_sample_target() >= 3 {
+                if let Some(status) = renderer.intelligent_sampling.status(self.output.viewport_denoise.is_some()) { ui.small(status); }
+            }
+            let denoiser = &renderer.viewport_denoise;
+            if let Some((backend, samples)) = denoiser.active_snapshot() {
+                ui.small(format!("Denoising {samples} spp on {}", backend.label()));
+            }
+            if let Some(frame) = &denoiser.presented {
+                ui.small(format!("Denoised pass {}, shown at {}", frame.samples, frame.traced_samples));
+                ui.small(format!("Readback {:.1} ms · Prepare {:.1} ms", frame.readback_ms, frame.preparation_ms))
+                    .on_hover_text("Readback includes GPU queue wait and copying the snapshot to CPU memory.");
+                ui.small(format!("OIDN {:.1} ms · Present {:.1} ms", frame.oidn_ms, frame.presentation_ms))
+                    .on_hover_text("OIDN includes setup and internal transfers. Present is measured from OIDN completion to the window presentation call.");
+            }
+            if let Some(error) = &denoiser.error { ui.small(error); }
+        }
     }
 
     fn lighting_ui(&mut self, ui: &mut egui::Ui) {
@@ -1585,7 +2115,7 @@ impl App {
         ui.checkbox(&mut self.lighting.enabled, "Enabled");
         ui.add_enabled_ui(self.lighting.enabled, |ui| {
             ui.checkbox(&mut self.lighting.shadows, "Cast shadows");
-            ui.horizontal(|ui| { ui.label("Light color"); ui.color_edit_button_rgb(&mut self.lighting.light_color); });
+            ui.horizontal(|ui| { ui.label("Light color"); color_edit_button(ui, &mut self.lighting.light_color); });
             for (angle, limit, label) in [
                 (&mut self.lighting.azimuth, 180.0, "Azimuth"),
                 (&mut self.lighting.elevation, 1.55_f32.to_degrees(), "Elevation"),
@@ -1602,52 +2132,62 @@ impl App {
             });
         });
         ui.separator(); ui.heading("Environment");
-        if self.lighting.path_traced {
-            egui::ComboBox::from_label("Source")
-                .selected_text(ENVIRONMENT_NAMES[self.lighting.environment])
-                .show_ui(ui, |ui| {
-                    for (index, name) in ENVIRONMENT_NAMES.into_iter().enumerate() {
-                        ui.selectable_value(&mut self.lighting.environment, index, name);
+        let previous_source = self.lighting.environment;
+        let mut source = if self.lighting.path_traced || previous_source == HDRI_ENVIRONMENT { previous_source } else { 0 };
+        let shown_source = source;
+        egui::ComboBox::from_label("Source")
+            .selected_text(ENVIRONMENT_NAMES[source])
+            .show_ui(ui, |ui| {
+                for (index, name) in ENVIRONMENT_NAMES.into_iter().enumerate() {
+                    if self.lighting.path_traced || index == 0 || index == HDRI_ENVIRONMENT {
+                        ui.selectable_value(&mut source, index, name);
                     }
-                });
-            if self.lighting.environment != 0 {
-                precision_slider(ui, &mut self.lighting.environment_rotation, -180.0..=180.0, "Rotation (°)", false, false);
-            }
-            if self.lighting.environment == HDRI_ENVIRONMENT {
-                ui.add(egui::TextEdit::singleline(&mut self.hdri_input).hint_text("Path to a .hdr panorama"));
-                ui.horizontal(|ui| {
-                    #[cfg(windows)]
-                    if ui.button("Browse…").clicked() {
-                        match hdri::choose_file(self.window.as_deref()) {
-                            Ok(Some(path)) => {
-                                self.hdri_input = path.to_string_lossy().into_owned();
-                                self.apply_hdri_path(&path);
-                            }
-                            Ok(None) => {}
-                            Err(error) => self.hdri_status = error,
+                }
+            });
+        if source != shown_source {
+            self.lighting.environment = source;
+            self.lighting.environment_strength = self.lighting.environment_strength.min(self.lighting.environment_intensity_max());
+        }
+        if source != 0 {
+            precision_slider(ui, &mut self.lighting.environment_rotation, -180.0..=180.0, "Rotation (°)", false, false);
+        }
+        if source == HDRI_ENVIRONMENT {
+            ui.add(egui::TextEdit::singleline(&mut self.hdri_input).hint_text("Path to a .hdr panorama"));
+            ui.horizontal(|ui| {
+                #[cfg(windows)]
+                if ui.button("Browse…").clicked() {
+                    match hdri::choose_file(self.window.as_deref()) {
+                        Ok(Some(path)) => {
+                            self.hdri_input = path.to_string_lossy().into_owned();
+                            self.apply_hdri_path(&path);
                         }
+                        Ok(None) => {}
+                        Err(error) => self.hdri_status = error,
                     }
-                    if ui.add_enabled(!self.hdri_input.trim().is_empty(), egui::Button::new("Load")).clicked() {
-                        let path = std::path::PathBuf::from(self.hdri_input.trim().trim_matches('"'));
-                        self.apply_hdri_path(&path);
-                    }
-                });
-                if !self.hdri_status.is_empty() { ui.small(&self.hdri_status); }
-            }
+                }
+                if ui.add_enabled(!self.hdri_input.trim().is_empty(), egui::Button::new("Load")).clicked() {
+                    let path = std::path::PathBuf::from(self.hdri_input.trim().trim_matches('"'));
+                    self.apply_hdri_path(&path);
+                }
+            });
+            if !self.hdri_status.is_empty() { ui.small(&self.hdri_status); }
         }
         ui.horizontal(|ui| {
-            ui.label(if self.lighting.path_traced && self.lighting.environment != 0 { "Tint" } else { "Light color" });
-            ui.color_edit_button_rgb(&mut self.lighting.environment_color);
+            ui.label(if self.lighting.environment == HDRI_ENVIRONMENT || (self.lighting.path_traced && self.lighting.environment != 0) { "Tint" } else { "Light color" });
+            color_edit_button(ui, &mut self.lighting.environment_color);
         });
-        precision_slider(ui, &mut self.lighting.environment_strength, 0.0..=2.0, "Intensity", false, false);
-        if self.lighting.path_traced {
+        let intensity_max = self.lighting.environment_intensity_max();
+        precision_slider(ui, &mut self.lighting.environment_strength, 0.0..=intensity_max, "Intensity", false, false);
+        let environment_supported = self.lighting.path_traced || self.lighting.environment == HDRI_ENVIRONMENT;
+        if environment_supported {
             ui.checkbox(&mut self.lighting.show_environment, "Show environment as background");
         }
-        let environment_visible = self.lighting.path_traced && self.lighting.show_environment && !self.section_active();
+        let environment_visible = (self.lighting.path_traced || self.environment_texture().is_some())
+            && self.lighting.show_environment && !self.section_active();
         ui.add_enabled_ui(!environment_visible, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Background color");
-                ui.color_edit_button_rgb(&mut self.background_color);
+                color_edit_button(ui, &mut self.background_color);
             });
         }).response.on_disabled_hover_text("Turn off Show environment as background to use a solid color.");
         if !self.lighting.path_traced {
@@ -1667,7 +2207,7 @@ impl App {
             .on_hover_text("Distance from the camera, in scene units. Hold Shift for fine adjustment.");
         ui.horizontal(|ui| {
             ui.label("Color");
-            ui.color_edit_button_rgb(&mut self.effects.fog_color);
+            color_edit_button(ui, &mut self.effects.fog_color);
         });
     }
 
@@ -1692,9 +2232,9 @@ impl App {
         self.hdri = panorama;
     }
 
-    fn environment_texture(&self) -> Option<&wgpu::TextureView> {
-        if self.lighting.path_traced && self.lighting.environment == HDRI_ENVIRONMENT {
-            self.hdri.as_ref().map(|asset| &asset.view)
+    fn environment_texture(&self) -> Option<&hdri::Environment> {
+        if self.lighting.environment == HDRI_ENVIRONMENT {
+            self.hdri.as_ref().map(|asset| &asset.texture)
         } else {
             None
         }
@@ -1725,6 +2265,18 @@ impl App {
                     self.effects.set_f_stop(f_stop);
                 }
                 precision_slider(ui, &mut self.effects.focus, 0.0001..=30.0, "Focus distance", true, false);
+                let blades = self.effects.aperture_blades;
+                egui::ComboBox::from_label("Aperture blades")
+                    .selected_text(if blades == 0 { "Circular".into() } else { blades.to_string() })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.effects.aperture_blades, 0, "Circular");
+                        for blades in 3..=16 {
+                            ui.selectable_value(&mut self.effects.aperture_blades, blades, blades.to_string());
+                        }
+                    });
+                if self.effects.aperture_blades >= 3 {
+                    precision_slider(ui, &mut self.effects.aperture_rotation, -180.0..=180.0, "Aperture rotation", false, true);
+                }
                 if ui.button(if self.picking_focus { "Cancel focus pick" } else { "Pick focus" }).clicked() {
                     self.picking_focus = !self.picking_focus;
                 }
@@ -1738,9 +2290,8 @@ impl App {
         if roll_degrees != self.camera.roll.to_degrees() { self.camera.set_roll(roll_degrees.to_radians()); }
         if ui.button("Reset rotation").clicked() { self.camera.yaw = 0.0; self.camera.pitch = 0.0; self.camera.set_roll(0.0); }
         precision_slider(ui, &mut self.camera.speed, 0.001..=100.0, "Speed", true, false);
-        if ui.button("Reset framing").on_hover_text("Return to the starting camera position and focal length.").clicked() {
-            self.camera = Camera { speed: self.camera.speed, ..Camera::starting_view() };
-            self.effects.set_focal(STARTING_FOCAL_MM);
+        if ui.button("Reset framing").on_hover_text("Frame the selected fractal from its starting camera position.").clicked() {
+            self.reset_framing();
         }
         ui.small("WASD: move · E / Q: up / down\nRight mouse: look · Wheel: speed");
     }
@@ -1828,7 +2379,8 @@ impl App {
                 let matte = egui::Rect::from_min_max(min, max);
                 if matte.is_positive() { painter.rect_filled(matte, 0.0, shade); }
             }
-            painter.rect_stroke(frame, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(180)), egui::StrokeKind::Inside);
+            painter.with_clip_rect(available.shrink2(egui::vec2(2.0, 0.0)))
+                .rect_stroke(frame, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(180)), egui::StrokeKind::Inside);
         }
         if self.section_active() { self.picking_focus = false; }
         if self.picking_focus && !ctx.is_pointer_over_area() {
@@ -1923,14 +2475,20 @@ impl App {
         ]);
         if self.material == DIFFUSE_GRAY_MATERIAL {
             // IOR 1 with zero specular, coat and emission gives a Lambertian surface.
-            uniforms[SURFACE_UNIFORM_OFFSET..].copy_from_slice(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+            uniforms[SURFACE_UNIFORM_OFFSET..SIERPINSKI_UNIFORM_OFFSET].copy_from_slice(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
         } else {
             let finish = if self.material == MATCAP_MATERIAL { &self.matcap.finish } else { &self.custom_finish };
             let [r, g, b] = finish.emission_color.map(|channel| channel * finish.emission_strength);
-            uniforms[SURFACE_UNIFORM_OFFSET..].copy_from_slice(&[
+            uniforms[SURFACE_UNIFORM_OFFSET..SIERPINSKI_UNIFORM_OFFSET].copy_from_slice(&[
                 finish.ior, finish.specular, finish.coat, finish.coat_roughness, r, g, b, 0.0,
             ]);
         }
+        uniforms[SIERPINSKI_UNIFORM_OFFSET] = self.sierpinski.depth as f32;
+        uniforms[ORBIT_DEPTH_UNIFORM_OFFSET..FOUR_BRANCH_UNIFORM_OFFSET].copy_from_slice(&self.orbit_depths.offsets());
+        uniforms[FOUR_BRANCH_UNIFORM_OFFSET..FOUR_BRANCH_UNIFORM_OFFSET + 5].copy_from_slice(&self.four_branch.uniforms());
+        let [blades, rotation] = self.effects.bokeh();
+        uniforms[BOKEH_UNIFORM_OFFSET..BOKEH_UNIFORM_OFFSET + 2].copy_from_slice(&[blades, rotation.to_radians()]);
+        uniforms[PIXEL_SAMPLING_UNIFORM] = self.pixel_sampling.uniform();
         uniforms
     }
 
@@ -1980,7 +2538,19 @@ impl App {
         values[PRESET_SURFACE_FIELDS..PRESET_PRINCIPLED_FIELDS].copy_from_slice(&self.material_settings);
         values[PRESET_PRINCIPLED_FIELDS..PRESET_PRINCIPLED_FIELDS + 8].copy_from_slice(&self.material_finish.values());
         values[PRESET_PRINCIPLED_FIELDS + 8..PRESET_MATCAP_FIELDS].copy_from_slice(&self.custom_finish.values());
-        values[PRESET_MATCAP_FIELDS..].copy_from_slice(&self.matcap.values());
+        values[PRESET_MATCAP_FIELDS..PRESET_SIERPINSKI_FIELDS].copy_from_slice(&self.matcap.values());
+        values[PRESET_SIERPINSKI_FIELDS] = self.sierpinski.depth as f32;
+        values[PRESET_ORBIT_DEPTH_FIELDS..PRESET_ORBIT_DEPTH_FIELDS + 4].copy_from_slice(&self.orbit_depths.values());
+        values[PRESET_FOUR_BRANCH_FIELDS..PRESET_FOUR_BRANCH_FIELDS + 4].copy_from_slice(&self.four_branch.values());
+        for (index, stage) in std::iter::once(&self.mutation).chain(&self.extra_mutations).enumerate()
+        {
+            values[PRESET_SIERPINSKI_FIELDS + 1 + index] = stage.sierpinski.depth as f32;
+            let offset = PRESET_ORBIT_DEPTH_FIELDS + 4 * (index + 1);
+            values[offset..offset + 4].copy_from_slice(&stage.orbit_depths.values());
+            let offset = PRESET_FOUR_BRANCH_FIELDS + 4 * (index + 1);
+            values[offset..offset + 4].copy_from_slice(&stage.four_branch.values());
+        }
+        values[PRESET_BOKEH_FIELDS..].copy_from_slice(&self.effects.bokeh());
         values
     }
 
@@ -2005,8 +2575,8 @@ impl App {
             if v.len() == 36 && v[21] == v[35] { v.remove(21); }
             let material = v.get(11).copied().unwrap_or(-1.0);
             let valid_material = (0.0..LEGACY_MATERIAL_DEFAULTS.len() as f32).contains(&material)
-                || (v.len() == PRESET_VALUE_COUNT && material == MATCAP_MATERIAL as f32);
-            if !matches!(v.len(), 17..=21 | 33..=35 | 43 | 45..=48 | 52 | 55 | 58 | 60 | 63 | 74 | 79 | 95 | BASE_PRESET_FIELDS | CASCADE_PRESET_FIELDS | PRESET_LIGHT_FLAGS | PRESET_ENVIRONMENT_FIELDS | PRESET_PATH_FIELDS | PRESET_MOVING_SAMPLES | PRESET_MOVING_BOUNCES | PRESET_SURFACE_FIELDS | PRESET_PRINCIPLED_FIELDS | PRESET_MATCAP_FIELDS | PRESET_VALUE_COUNT)
+                || (v.len() >= PRESET_SIERPINSKI_FIELDS && material == MATCAP_MATERIAL as f32);
+            if !matches!(v.len(), 17..=21 | 33..=35 | 43 | 45..=48 | 52 | 55 | 58 | 60 | 63 | 74 | 79 | 95 | BASE_PRESET_FIELDS | CASCADE_PRESET_FIELDS | PRESET_LIGHT_FLAGS | PRESET_ENVIRONMENT_FIELDS | PRESET_PATH_FIELDS | PRESET_MOVING_SAMPLES | PRESET_MOVING_BOUNCES | PRESET_SURFACE_FIELDS | PRESET_PRINCIPLED_FIELDS | PRESET_MATCAP_FIELDS | PRESET_SIERPINSKI_FIELDS | PRESET_FOUR_BRANCH_FIELDS | PRESET_BOKEH_FIELDS | PRESET_VALUE_COUNT)
                 || v.iter().any(|x| !x.is_finite())
                 || !valid_material
                 || material.fract() != 0.0
@@ -2042,11 +2612,13 @@ impl App {
             (58.., Some(Fractal::Menger)) => Fractal::Menger,
             (95.., Some(formula @ (Fractal::Kifs | Fractal::AmazingSurface))) => formula,
             (BASE_PRESET_FIELDS.., Some(Fractal::PseudoKleinian)) => Fractal::PseudoKleinian,
+            (PRESET_FOUR_BRANCH_FIELDS.., Some(Fractal::Sierpinski)) => Fractal::Sierpinski,
+            (PRESET_BOKEH_FIELDS.., Some(Fractal::FourBranch)) => Fractal::FourBranch,
             (_, Some(Fractal::Mandelbulb)) => Fractal::Mandelbulb,
             _ => Fractal::Mandelbox,
         }; self.diagnostic = v[10] != 0.0; self.material = (v[11] as u32).min(MATCAP_MATERIAL); self.ao = v[12] != 0.0; self.ao_strength = v[13].clamp(*AO_STRENGTH_RANGE.start(), *AO_STRENGTH_RANGE.end()); self.ao_radius = v[14].clamp(0.0001, 2.0); self.exposure = v[15].clamp(-5.0, 5.0); self.normal_smoothing = v[16].clamp(*SMOOTHNESS.start(), *SMOOTHNESS.end()); self.quality = v.get(17).copied().unwrap_or(1.0).clamp(*DETAIL_QUALITY.start(), *DETAIL_QUALITY.end()); self.distant_filter = v.get(19).copied().unwrap_or(2.0).clamp(0.5, 4.0);
         if v.len() >= 33 {
-            self.lighting = Lighting { color: [v[21].clamp(0.0,1.0), v[22].clamp(0.0,1.0), v[23].clamp(0.0,1.0)], roughness: v[24].clamp(0.05,1.0), metallic: v[25].clamp(0.0,1.0), light_color: [v[26].clamp(0.0,1.0),v[27].clamp(0.0,1.0),v[28].clamp(0.0,1.0)], azimuth: v[29].clamp(-std::f32::consts::PI,std::f32::consts::PI), elevation: v[30].clamp(-1.55,1.55), intensity: v[31].clamp(0.0,4.0), environment_strength: v[32].clamp(0.0,2.0), ..Lighting::default() };
+            self.lighting = Lighting { color: [v[21].clamp(0.0,1.0), v[22].clamp(0.0,1.0), v[23].clamp(0.0,1.0)], roughness: v[24].clamp(0.05,1.0), metallic: v[25].clamp(0.0,1.0), light_color: [v[26].clamp(0.0,1.0),v[27].clamp(0.0,1.0),v[28].clamp(0.0,1.0)], azimuth: v[29].clamp(-std::f32::consts::PI,std::f32::consts::PI), elevation: v[30].clamp(-1.55,1.55), intensity: v[31].clamp(0.0,4.0), ..Lighting::default() };
         } else {
             self.lighting = Lighting::default();
         }
@@ -2066,6 +2638,9 @@ impl App {
                 self.material = if *diffuse != 0.0 { DIFFUSE_GRAY_MATERIAL } else { STANDARD_MATERIAL };
             }
         }
+        if let Some(&strength) = v.get(32) {
+            self.lighting.environment_strength = strength.clamp(0.0, self.lighting.environment_intensity_max());
+        }
         self.material_settings = LEGACY_MATERIAL_DEFAULTS.get(self.material as usize).copied().unwrap_or(DIFFUSE_DEFAULTS);
         if let Some([r, g, b, roughness, metallic]) = v.get(PRESET_SURFACE_FIELDS..PRESET_PRINCIPLED_FIELDS) {
             self.material_settings = [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0),
@@ -2073,7 +2648,7 @@ impl App {
         }
         self.material_finish = SurfaceFinish::from_values(v.get(PRESET_PRINCIPLED_FIELDS..PRESET_PRINCIPLED_FIELDS + 8).unwrap_or_default());
         self.custom_finish = SurfaceFinish::from_values(v.get(PRESET_PRINCIPLED_FIELDS + 8..PRESET_MATCAP_FIELDS).unwrap_or_default());
-        self.matcap = MatcapMaterial::from_values(v.get(PRESET_MATCAP_FIELDS..).unwrap_or_default());
+        self.matcap = MatcapMaterial::from_values(v.get(PRESET_MATCAP_FIELDS..PRESET_SIERPINSKI_FIELDS).unwrap_or_default());
         if !MATERIALS.iter().any(|(id, _)| *id == self.material) {
             let [r, g, b, roughness, metallic] = self.material_settings;
             self.lighting.color = [r, g, b];
@@ -2096,12 +2671,13 @@ impl App {
         if self.camera.roll == 0.0 { self.camera.look_roll = 0.0; }
         // Reuse the old stationary sample count. A disabled legacy toggle used the default in path-traced mode.
         let samples = v.get(34).copied().unwrap_or(DEFAULT_VIEWPORT_SAMPLES as f32) as u32;
-        self.still_samples = if v.get(20) != Some(&0.0) && SAMPLE_COUNTS.contains(&samples) {
+        self.still_samples = if v.get(20) != Some(&0.0) && (1..=noise_sampling::MAX_SAMPLES).contains(&samples) {
             samples
         } else {
             DEFAULT_VIEWPORT_SAMPLES
         };
         self.effects = CameraEffects::from_preset(v.get(35..v.len().min(44)).unwrap_or_default());
+        self.effects.restore_bokeh(v.get(PRESET_BOKEH_FIELDS..).unwrap_or_default());
         let legacy_contrast = if self.effects.dof_enabled && self.effects.aperture > 0.0 {
             v.get(44).copied().unwrap_or(1.12)
         } else {
@@ -2117,13 +2693,24 @@ impl App {
             _ => DEFAULT_BACKGROUND,
         };
         self.mutation = MutationStage::from_preset(v.get(63..v.len().min(79)).unwrap_or_default());
+        self.sierpinski = SierpinskiParameters::from_preset(v.get(PRESET_SIERPINSKI_FIELDS));
+        self.mutation.sierpinski = SierpinskiParameters::from_preset(v.get(PRESET_SIERPINSKI_FIELDS + 1));
+        self.orbit_depths = OrbitDepths::from_preset(v.get(PRESET_ORBIT_DEPTH_FIELDS..PRESET_ORBIT_DEPTH_FIELDS + 4));
+        self.mutation.orbit_depths = OrbitDepths::from_preset(v.get(PRESET_ORBIT_DEPTH_FIELDS + 4..PRESET_ORBIT_DEPTH_FIELDS + 8));
+        self.four_branch = FourBranchParameters::from_preset(v.get(PRESET_FOUR_BRANCH_FIELDS..PRESET_FOUR_BRANCH_FIELDS + 4));
+        self.mutation.four_branch = FourBranchParameters::from_preset(v.get(PRESET_FOUR_BRANCH_FIELDS + 4..PRESET_FOUR_BRANCH_FIELDS + 8));
         self.fold_parameters = FoldParameters::from_preset(v.get(79..87).unwrap_or_default(), v.get(95..99).unwrap_or_default());
         self.mutation.fold_parameters = FoldParameters::from_preset(v.get(87..95).unwrap_or_default(), v.get(99..103).unwrap_or_default());
         let count = v.get(BASE_PRESET_FIELDS).copied().unwrap_or(0.0) as usize;
         self.extra_mutations = v.get(BASE_PRESET_FIELDS + 1..).unwrap_or_default()
-            .chunks_exact(MUTATION_PRESET_FIELDS).take(count.min(MAX_MUTATIONS - 1)).map(|values| {
+            .chunks_exact(MUTATION_PRESET_FIELDS).take(count.min(MAX_MUTATIONS - 1)).enumerate().map(|(index, values)| {
                 let mut stage = MutationStage::from_preset(&values[..16]);
                 stage.fold_parameters = FoldParameters::from_preset(&values[16..24], &values[24..]);
+                stage.sierpinski = SierpinskiParameters::from_preset(v.get(PRESET_SIERPINSKI_FIELDS + 2 + index));
+                let offset = PRESET_ORBIT_DEPTH_FIELDS + 4 * (index + 2);
+                stage.orbit_depths = OrbitDepths::from_preset(v.get(offset..offset + 4));
+                let offset = PRESET_FOUR_BRANCH_FIELDS + 4 * (index + 2);
+                stage.four_branch = FourBranchParameters::from_preset(v.get(offset..offset + 4));
                 stage
             }).collect();
         self.base_weight = v.get(CASCADE_PRESET_FIELDS + 1).copied().unwrap_or(1.0).clamp(0.0, 1.0);
@@ -2251,19 +2838,25 @@ impl ApplicationHandler<startup::Event> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if let Some(renderer) = &mut self.renderer { renderer.resize(size.width, size.height); }
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.resize(size.width, size.height);
+                    self.last_scene.clear();
+                }
                 if let Some(window) = &self.window { window.request_redraw(); }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
                     if event.state == ElementState::Pressed {
                         self.keys.insert(key);
-                        if key == KeyCode::KeyR && !event.repeat { self.camera = Camera::default(); }
+                        if key == KeyCode::KeyR && !event.repeat { self.reset_framing(); }
                         if key == KeyCode::KeyG && !event.repeat { self.diagnostic = !self.diagnostic; println!("Flat diagnostic: {}", if self.diagnostic { "ON" } else { "OFF" }); }
                         if key == KeyCode::KeyX { self.exposure = (self.exposure + 0.25).min(5.0); }
                         if key == KeyCode::KeyZ { self.exposure = (self.exposure - 0.25).max(-5.0); }
-                        if key == KeyCode::KeyN { self.normal_smoothing = (self.normal_smoothing * 1.25).min(*SMOOTHNESS.end()); }
-                        if key == KeyCode::KeyB { self.normal_smoothing = (self.normal_smoothing / 1.25).max(*SMOOTHNESS.start()); }
+                        if key == KeyCode::KeyN { self.normal_smoothing = (self.normal_smoothing * 1.25).clamp(SMOOTHNESS_KEY_FLOOR, *SMOOTHNESS.end()); }
+                        if key == KeyCode::KeyB {
+                            self.normal_smoothing = if self.normal_smoothing <= SMOOTHNESS_KEY_FLOOR { 0.0 }
+                                else { (self.normal_smoothing / 1.25).max(SMOOTHNESS_KEY_FLOOR) };
+                        }
                         if key == KeyCode::KeyO && !event.repeat { self.ao = !self.ao; println!("Ambient occlusion: {}", if self.ao { "ON" } else { "OFF" }); }
                         if key == KeyCode::KeyI { self.ao_strength = (self.ao_strength + 0.1).min(*AO_STRENGTH_RANGE.end()); self.ao = true; }
                         if key == KeyCode::KeyK { self.ao_strength = (self.ao_strength - 0.1).max(*AO_STRENGTH_RANGE.start()); self.ao = true; }
@@ -2319,7 +2912,15 @@ impl ApplicationHandler<startup::Event> for App {
                 if let Some(window) = &self.window { window.request_redraw(); }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(renderer) = &mut self.renderer { renderer.poll_viewport_denoise(); }
+                if let Some(renderer) = &mut self.renderer {
+                    if let Some(Some(stats)) = renderer.poll_viewport_work() {
+                        self.adaptive_viewport.observe(stats);
+                    }
+                    if renderer.viewport_in_flight.is_some() { renderer.poll_redraw = true; return; }
+                    renderer.poll_redraw = false;
+                    renderer.poll_noise_sampling();
+                    renderer.poll_viewport_denoise();
+                }
                 if let Some(job) = &self.render_job {
                     let mut finished = None;
                     while let Ok(update) = job.receiver.try_recv() {
@@ -2376,7 +2977,9 @@ impl ApplicationHandler<startup::Event> for App {
                         let uniforms = self.camera_uniforms([self.output.width as f32, self.output.height as f32], None, [0.0; 4], true);
                         let request = export::Request {
                             width: self.output.width.clamp(64,8192), height: self.output.height.clamp(64,8192),
-                            samples: self.output.samples, denoise: self.output.denoise, uniforms, environment: self.environment_texture().cloned(),
+                            samples: self.output.samples, noise: self.output.render_noise,
+                            time_limit: Duration::from_secs_f32(self.output.time_limit.max(0.0).min(86400.0)),
+                            denoise: self.output.denoise, uniforms, environment: self.environment_texture().cloned(),
                         };
                         let (sender, receiver) = std::sync::mpsc::channel();
                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2390,33 +2993,25 @@ impl ApplicationHandler<startup::Event> for App {
                 let screen = ctx.screen_rect();
                 let frame = self.frame.unwrap_or(screen);
                 let projection = camera_effects::viewport_projection(screen, frame);
-                let mut scene = vec![self.camera.position[0], self.camera.position[1], self.camera.position[2], self.camera.yaw, self.camera.pitch, self.camera.roll, self.slice.is_some() as u8 as f32, self.slice.unwrap_or(0.0), self.power, self.fractal.value(), self.diagnostic as u8 as f32, self.material as f32, self.ao as u8 as f32, self.ao_strength, self.ao_radius, self.exposure, self.normal_smoothing, self.quality, self.distant_filter, self.lighting.color[0], self.lighting.color[1], self.lighting.color[2], self.lighting.roughness, self.lighting.metallic, self.lighting.light_color[0], self.lighting.light_color[1], self.lighting.light_color[2], self.lighting.azimuth, self.lighting.elevation, self.lighting.intensity, size.width as f32, size.height as f32];
-                scene.extend(self.lighting.environment_color);
-                scene.extend([self.lighting.environment_strength, self.lighting.angular_radius]);
-                scene.extend(self.lighting.path_preset());
-                scene.extend([flag(self.lighting.enabled), flag(self.lighting.shadows)]);
-                scene.extend(self.effects.preset());
-                scene.extend(self.material_settings);
-                scene.extend(self.material_finish.values());
-                scene.extend(self.custom_finish.values());
-                scene.extend(self.matcap.values());
-                scene.push(self.camera.look_roll);
-                scene.extend(self.mandelbox_parameters.values());
-                scene.extend(self.mandelbulb_parameters.values());
-                scene.extend(self.menger_parameters.values());
-                scene.extend(self.background_color);
-                scene.extend(self.mutation.values());
-                scene.extend(self.fold_parameters.values());
-                scene.extend(self.mutation.fold_parameters.values());
-                for stage in &self.extra_mutations {
-                    scene.extend(stage.stacked_preset_values());
-                }
-                scene.push(self.base_weight);
-                scene.extend(projection);
+                let mut scene = self.viewport_scene(size, projection);
                 let target = self.still_sample_target();
                 scene.push(target as f32);
                 let denoise_viewport = if !self.diagnostic && !self.section_active() { self.output.viewport_denoise } else { None };
                 scene.push(match denoise_viewport { None => 0.0, Some(denoise::Backend::Cpu) => 1.0, Some(denoise::Backend::Gpu) => 2.0 });
+                let viewport_noise = self.output.viewport_noise;
+                let noise_plan = if !self.diagnostic && !self.section_active() {
+                    viewport_noise.plan(target).filter(|_| self.renderer.as_mut().is_some_and(|renderer| {
+                        renderer.prepare_noise_sampling(denoise_viewport.is_some(), window.clone())
+                    }))
+                } else { None };
+                scene.extend([flag(noise_plan.is_some()), viewport_noise.threshold, viewport_noise.min_samples as f32]);
+                let wants_guiding = self.output.intelligent_sampling && !viewport_noise.enabled
+                    && target >= 3 && !self.diagnostic && !self.section_active();
+                let intelligent_sampling = wants_guiding && self.renderer.as_mut().is_some_and(|renderer| {
+                    let wake_window = window.clone();
+                    renderer.prepare_intelligent_sampling(denoise_viewport.is_some(), move || wake_window.request_redraw())
+                });
+                scene.push(flag(intelligent_sampling));
                 let selected_mutation = self.mutation.selected(self.fractal);
                 let extra_selected = self.extra_mutations.iter().any(|stage| stage.selected(self.fractal).is_some());
                 let mutation_selected = selected_mutation.is_some() || extra_selected;
@@ -2424,36 +3019,67 @@ impl ApplicationHandler<startup::Event> for App {
                 let ray_ao_preview = self.ray_traced_ao_preview();
                 let path_preview = self.path_traced_preview();
                 let shadows_preview = self.has_directional_shadows() && !self.diagnostic && !self.section_active();
-                let editing = (mutation_selected || ray_ao_preview || shadows_preview || path_preview) && dragging && ctx.is_using_pointer();
+                let scene_changed = scene != self.last_scene;
+                let editing = scene_changed && dragging && ctx.is_using_pointer()
+                    && (mutation_selected || ray_ao_preview || shadows_preview || path_preview);
                 let navigating = moving || self.looking;
                 let interacting = navigating || editing;
                 let environment = self.environment_texture().cloned();
                 let environment_changed = self.renderer.as_ref().is_some_and(|renderer| renderer.environment_view != environment);
-                let reset = scene != self.last_scene || interacting || environment_changed;
+                let reset = scene_changed || interacting || environment_changed;
+                if (interacting && !self.viewport_was_interacting)
+                    || (!interacting && (scene_changed || environment_changed))
+                {
+                    self.adaptive_viewport.restart();
+                }
+                if !navigating || !self.viewport_was_interacting { self.navigation_sample = 0; }
+                self.viewport_was_interacting = interacting;
                 if reset {
                     self.last_scene = scene;
                     self.idle_ready = false;
                     self.progress_samples = 0;
+                    self.still_timing = StillTiming::default();
                     self.progress_tile = 0;
                     self.refine_tiles_per_frame = 1;
                     self.idle_deadline = None;
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.noise_pending = None;
+                        renderer.noise_remaining = None;
+                        renderer.noise_tiles = None;
+                        if !viewport_noise.enabled { renderer.noise_buffers = None; }
+                    }
                 }
                 if !interacting && !self.idle_ready && self.idle_deadline.is_none() {
                     self.idle_deadline = Some(Instant::now() + Duration::from_millis(180));
                 }
                 let progressing = self.idle_ready && !interacting;
                 let capture_slot = self.capture_slot.take();
-                let composite_progress = progressing && capture_slot.is_none();
-                let advance = composite_progress && self.progress_samples < target;
+                // Capture a preset from the accumulated image when a still is already visible.
+                let composite_progress = progressing && (capture_slot.is_none() || self.progress_samples > 0);
+                let target = if self.renderer.as_ref().is_some_and(|renderer| renderer.noise_remaining == Some(0)) {
+                    self.progress_samples
+                } else { target };
+                let awaiting_noise = self.renderer.as_ref().is_some_and(|renderer| renderer.noise_pending.is_some());
+                let awaiting_denoise = self.renderer.as_ref().is_some_and(|renderer| {
+                    renderer.viewport_denoise.awaiting_first_preview()
+                        || (self.progress_tile == 0 && renderer.viewport_denoise.snapshot_pending(
+                            self.progress_samples, target, self.output.viewport_denoise_interval))
+                });
+                // Keep a complete checkpoint until OIDN can take its snapshot.
+                let advance = composite_progress && capture_slot.is_none() && self.progress_samples < target
+                    && !awaiting_denoise && !awaiting_noise;
                 let progress = composite_progress.then_some(self.progress_samples);
                 let mut data = self.camera_uniforms([size.width.max(1) as f32, size.height.max(1) as f32], progress, projection, false);
                 if navigating && capture_slot.is_none() && !self.diagnostic {
                     data[MOVING_SAMPLES_UNIFORM] = self.moving_samples as f32;
                     data[MOVING_BOUNCES_UNIFORM] = self.moving_bounces as f32;
+                    data[NAVIGATION_SAMPLE_UNIFORM] = self.navigation_sample as f32;
                 }
                 data[10] = frame.height() * output.pixels_per_point;
-                let preview_divisor = if capture_slot.is_some() {
+                let preview_divisor = if capture_slot.is_some() && !composite_progress {
                     4
+                } else if self.adaptive_viewport.enabled {
+                    if progressing { 1 } else { self.adaptive_viewport.divisor() }
                 } else if progressing {
                     if ray_ao_preview { 2 } else { 1 }
                 } else if ray_ao_preview || path_preview {
@@ -2467,7 +3093,17 @@ impl ApplicationHandler<startup::Event> for App {
                 };
                 let full_size = [size.width.max(1), size.height.max(1)];
                 let render_size = full_size.map(|side| side.div_ceil(preview_divisor));
-                let tile_count = render_size[0].div_ceil(REFINE_TILE_WIDTH) * render_size[1].div_ceil(REFINE_TILE_HEIGHT);
+                let preview_work = (self.adaptive_viewport.enabled && !progressing && capture_slot.is_none())
+                    .then_some(adaptive_viewport::PreviewWork {
+                        size: render_size, divisor: preview_divisor, samples: data[MOVING_SAMPLES_UNIFORM].max(1.0) as u32,
+                    });
+                if preview_work.is_some() {
+                    data[18] = (self.quality * 1.25).min(4.0).max(self.quality);
+                }
+                let active_tiles = self.renderer.as_ref().and_then(|renderer| renderer.noise_tiles.as_ref())
+                    .filter(|_| noise_plan.is_some());
+                let [columns, rows] = noise_sampling::viewport_tile_grid(render_size);
+                let tile_count = active_tiles.map_or(columns * rows, noise_sampling::ActiveTiles::len);
                 let refine_tiles = advance.then(|| {
                     if self.progress_tile > 0 || self.progress_samples > 0 {
                         // Back off quickly on hard tiles. Increase gradually when presentation stays responsive.
@@ -2477,13 +3113,24 @@ impl ApplicationHandler<startup::Event> for App {
                             self.refine_tiles_per_frame = (self.refine_tiles_per_frame + 1).min(MAX_REFINE_TILES_PER_FRAME);
                         }
                     }
-                    self.progress_tile..(self.progress_tile + self.refine_tiles_per_frame).min(tile_count)
+                    let end = match active_tiles {
+                        Some(tiles) => tiles.batch_end(self.progress_tile, self.refine_tiles_per_frame),
+                        None => (self.progress_tile + self.refine_tiles_per_frame).min(tile_count),
+                    };
+                    self.progress_tile..end
                 });
                 let next_tile = refine_tiles.as_ref().map_or(tile_count, |tiles| tiles.end);
+                let pass_started = advance.then(Instant::now);
                 let capture_result = self.renderer.as_mut().and_then(|renderer| {
                     renderer.set_environment(environment.as_ref());
+                    renderer.intelligent_sampling.enabled = intelligent_sampling;
+                    renderer.noise_plan = noise_plan;
                     renderer.viewport_denoise.configure(denoise_viewport, reset);
-                    renderer.render(data, progress, advance, refine_tiles, render_size, output, &ctx, capture_slot.is_some())
+                    let ready_to_present = renderer.viewport_denoise.ready_to_present();
+                    let capture = renderer.render(data, progress, advance, refine_tiles, render_size, output, &ctx,
+                        capture_slot.is_some(), self.adaptive_viewport.enabled, preview_work);
+                    if ready_to_present && !renderer.viewport_denoise.ready_to_present() { window.request_redraw(); }
+                    capture
                 });
                 if let Some(slot) = capture_slot {
                     match capture_result.unwrap_or_else(|| Err("Preview unavailable".into())) {
@@ -2501,7 +3148,12 @@ impl ApplicationHandler<startup::Event> for App {
                     }
                     window.request_redraw();
                 }
-                if advance && self.renderer.as_ref().is_some_and(|renderer| renderer.frame_submitted) {
+                let submitted = self.renderer.as_ref().is_some_and(|renderer| renderer.frame_submitted);
+                if submitted && navigating && capture_slot.is_none() {
+                    self.navigation_sample = (self.navigation_sample + self.moving_samples) % 1024;
+                }
+                if let Some(started) = pass_started.filter(|_| submitted) {
+                    self.still_timing.started.get_or_insert(started);
                     if next_tile < tile_count {
                         self.progress_tile = next_tile;
                     } else {
@@ -2509,14 +3161,28 @@ impl ApplicationHandler<startup::Event> for App {
                         self.progress_samples += 1;
                     }
                 }
-                if denoise_viewport.is_some() && composite_progress && self.progress_samples >= target {
+                // Denoise only at the end of a complete pass over the viewport.
+                if denoise_viewport.is_some() && composite_progress && self.progress_tile == 0 {
                     if let Some(renderer) = &mut self.renderer {
-                        let window = window.clone();
-                        renderer.viewport_denoise.start(&renderer.device, &renderer.queue, &renderer.accumulation, render_size,
-                            move || window.request_redraw());
+                        let wake_window = window.clone();
+                        if renderer.viewport_denoise.start(&renderer.device, &renderer.queue, &renderer.accumulation, render_size,
+                            self.progress_samples, target, self.output.viewport_denoise_interval, move || wake_window.request_redraw())
+                        {
+                            window.request_redraw();
+                        }
                     }
                 }
-                if moving || advance { window.request_redraw(); }
+                if composite_progress && submitted && self.progress_tile == 0 && self.progress_samples == target {
+                    if let Some(renderer) = &self.renderer {
+                        let denoiser = &renderer.viewport_denoise;
+                        let final_image = denoise_viewport.is_none() || denoiser.error.is_some()
+                            || denoiser.presented.as_ref().is_some_and(|frame| frame.samples == target);
+                        if final_image && renderer.noise_pending.is_none() {
+                            self.still_timing.finish(&renderer.queue);
+                        }
+                    }
+                }
+                if moving || advance || awaiting_noise || (self.adaptive_viewport.enabled && interacting) { window.request_redraw(); }
             }
             _ => {}
         }
@@ -2535,6 +3201,34 @@ impl ApplicationHandler<startup::Event> for App {
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             return;
+        }
+        if let Some(renderer) = &mut self.renderer {
+            if let Some(result) = renderer.poll_viewport_work() {
+                if let Some(stats) = result { self.adaptive_viewport.observe(stats); }
+                if let Some(window) = &self.window {
+                    if renderer.poll_redraw { window.request_redraw(); }
+                }
+                renderer.poll_redraw = false;
+            }
+            if renderer.viewport_in_flight.is_some() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + adaptive_viewport::POLL_INTERVAL));
+                return;
+            }
+            if let Some(pending) = &self.still_timing.pending {
+                let _ = renderer.device.poll(wgpu::Maintain::Poll);
+                match pending.try_recv() {
+                    Ok(finished) => {
+                        self.still_timing.completed = self.still_timing.started.map(|started| finished - started);
+                        self.still_timing.pending = None;
+                        if let Some(window) = &self.window { window.request_redraw(); }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + adaptive_viewport::POLL_INTERVAL));
+                        return;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => self.still_timing.pending = None,
+                }
+            }
         }
         if let Some(deadline) = self.idle_deadline {
             if Instant::now() >= deadline {
@@ -2566,6 +3260,104 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn render_noise_checkbox_fits_its_clip_when_hovered() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 900.0));
+        let render = |ctx: &egui::Context, app: &mut super::App, pointer: Option<egui::Pos2>| {
+            ctx.run(egui::RawInput {
+                screen_rect: Some(screen),
+                events: pointer.into_iter().map(egui::Event::PointerMoved).collect(),
+                ..Default::default()
+            }, |ctx| app.ui(ctx))
+        };
+        let labels = |frame: &egui::FullOutput| {
+            frame.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Noise Threshold" => Some(text.visual_bounding_rect()),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        let checkbox = |frame: &egui::FullOutput, label: egui::Rect| {
+            frame.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if (0.0..=8.0).contains(&(label.left() - rect.rect.right()))
+                    && (rect.rect.center().y - label.center().y).abs() < 3.0
+                    && (12.0..=21.0).contains(&rect.rect.width()) =>
+                    Some((shape.shape.visual_bounding_rect(), shape.clip_rect)),
+                _ => None,
+            }).expect("noise checkbox")
+        };
+        for index in 0..2 {
+            let mut app = super::App::default();
+            let ctx = egui::Context::default();
+            let idle = render(&ctx, &mut app, None);
+            let label = labels(&idle)[index];
+            let (idle_square, _) = checkbox(&idle, label);
+            let hovered = render(&ctx, &mut app, Some(label.center()));
+            let (square, clip) = checkbox(&hovered, labels(&hovered)[index]);
+            assert!(square.width() > idle_square.width(), "checkbox {index} stayed at {square:?} from {idle_square:?}");
+            assert!(clip.contains_rect(square), "checkbox {square:?} is clipped by {clip:?}");
+        }
+    }
+
+    #[test]
+    fn aperture_shape_round_trips_and_legacy_presets_keep_a_circular_aperture() {
+        let mut app = super::App::default();
+        app.fractal = super::Fractal::FourBranch;
+        app.effects.dof_enabled = true;
+        app.effects.aperture_blades = 6;
+        app.effects.aperture_rotation = 30.0;
+        let preset = app.preset_values();
+        let mut restored = super::App::default();
+        restored.restore_scene(&preset);
+        assert_eq!(restored.effects.bokeh(), [6.0, 30.0]);
+        let uniforms = restored.camera_uniforms([640.0, 480.0], None, [0.0; 4], true);
+        assert_eq!(&uniforms[super::BOKEH_UNIFORM_OFFSET..][..2], &[6.0, 30.0_f32.to_radians()]);
+        restored.restore_scene(&preset[..super::PRESET_BOKEH_FIELDS]);
+        assert_eq!(restored.fractal, super::Fractal::FourBranch);
+        assert_eq!(restored.effects.bokeh(), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn render_panel_labels_fit_at_minimum_width() {
+        let mut app = super::App::default();
+        app.lighting.path_traced = true;
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1000.0));
+        let frame = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+            app.ui(ctx);
+        });
+        for label in ["Noise Threshold", "Intelligent ray sampling", "Denoise Interval", "Moving bounces", "Max bounces"] {
+            let (bounds, clip) = frame.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => Some((text.visual_bounding_rect(), shape.clip_rect)),
+                _ => None,
+            }).unwrap_or_else(|| panic!("Missing Render panel label {label}"));
+            assert!(clip.contains_rect(bounds), "{label} is clipped: {bounds:?} outside {clip:?}");
+        }
+    }
+
+    #[test]
+    fn hdr_environment_intensity_survives_preset_restore() {
+        let mut app = super::App::default();
+        app.lighting.path_traced = true;
+        app.lighting.environment = super::HDRI_ENVIRONMENT;
+        app.lighting.environment_strength = 10.0;
+        let mut values = app.preset_values();
+        let mut restored = super::App::default();
+        restored.restore_scene(&values);
+        assert_eq!(restored.lighting.environment_strength, 10.0);
+
+        let uniforms = restored.camera_uniforms([640.0, 480.0], None, [0.0; 4], true);
+        assert_eq!(&uniforms[super::LIGHTING_UNIFORM_OFFSET..][..3], &[10.0; 3]);
+
+        values[super::PRESET_PATH_FIELDS] = 0.0;
+        restored.restore_scene(&values);
+        assert_eq!(restored.lighting.environment, super::HDRI_ENVIRONMENT);
+        assert_eq!(restored.lighting.environment_strength, 10.0);
+
+        values[super::PRESET_PATH_FIELDS + 1] = 0.0;
+        restored.restore_scene(&values);
+        assert_eq!(restored.lighting.environment_strength, 2.0);
+    }
+
     #[test]
     fn png_uses_the_viewports_stationary_detail_settings() {
         let mut app = super::App::default();
@@ -2661,6 +3453,7 @@ mod tests {
         let panel_id = egui::Id::new("controls");
         for path_traced in [false, true] {
             app.lighting.path_traced = path_traced;
+            let mut previous_scene = None;
             for tab in super::ControlsTab::ALL {
                 app.controls_tab = tab;
                 ctx.data_mut(|data| {
@@ -2670,10 +3463,19 @@ mod tests {
                 });
                 let _ = ctx.run(input(), |ctx| {
                     app.ui(ctx);
+                    app.update_render_frame(ctx);
                     let width = ctx.available_rect().left();
                     assert!((super::CONTROLS_MIN_WIDTH..=super::CONTROLS_MIN_WIDTH + 2.0).contains(&width), "{} tab width: {width}", tab.label());
                     assert!(ctx.available_rect().width() >= 150.0);
                 });
+                let projection = super::camera_effects::viewport_projection(screen, app.frame.unwrap());
+                let scene = app.viewport_scene(winit::dpi::PhysicalSize::new(760, 320), projection);
+                if let Some(previous) = &previous_scene {
+                    let changes: Vec<_> = scene.iter().zip(previous).enumerate()
+                        .filter_map(|(index, (value, old))| (value != old).then_some((index, old, value))).collect();
+                    assert!(previous == &scene, "{} changed the viewport scene: {changes:?}", tab.label());
+                }
+                previous_scene = Some(scene);
             }
         }
         app.left_open = false;
@@ -2692,6 +3494,8 @@ mod tests {
     fn startup_frames_menger_from_above_a_corner() {
         let app = super::App::default();
         assert_eq!(app.fractal, super::Fractal::Menger);
+        assert_eq!(app.material, super::MATCAP_MATERIAL);
+        assert_eq!(app.matcap.style_name(), "Original");
         assert_eq!(app.fractal_title(), "MengerVibes - Menger");
         let [x, y, z] = app.camera.position;
         assert!(x > 1.0 && x == y && y == z);
@@ -2720,6 +3524,21 @@ mod tests {
         assert!(camera.pitch < 1.54);
         camera.set_roll(0.0);
         assert_eq!(camera.view_roll(), 0.0);
+    }
+
+    #[test]
+    fn switching_formulas_reframes_only_a_camera_at_its_starting_view() {
+        use super::Fractal::{Mandelbox, Mandelbulb, Menger};
+        let mut app = super::App::default();
+        assert_eq!(app.fractal, Menger);
+        app.select_fractal(Mandelbox);
+        assert_eq!(app.camera.position, super::Camera::framed_view(Mandelbox).position);
+        app.camera.position = [2.0, 4.0, 8.0];
+        app.select_fractal(Mandelbulb);
+        assert_eq!(app.camera.position, [2.0, 4.0, 8.0]);
+        app.reset_framing();
+        assert_eq!(app.camera.position, super::Camera::framed_view(Mandelbulb).position);
+        assert_eq!(app.effects.focal, super::STARTING_FOCAL_MM);
     }
 
     #[test]
@@ -2753,6 +3572,64 @@ mod tests {
         assert_eq!(app.preset_values(), edited);
         assert_eq!(app.output.width, 800);
         assert!(!app.show_frame);
+    }
+
+    #[test]
+    fn formula_depths_round_trip_for_base_and_mutations() {
+        use super::Fractal::{Mandelbox, Sierpinski};
+        let mut app = super::App::default();
+        app.fractal = Sierpinski;
+        app.sierpinski.depth = 14;
+        app.orbit_depths = super::OrbitDepths([5, 14, 10, 8]);
+        app.mutation.formula = Some(Mandelbox);
+        app.mutation.orbit_depths.0[1] = 14;
+        app.extra_mutations.push(super::MutationStage::default());
+        app.extra_mutations[0].sierpinski.depth = 3;
+        app.extra_mutations[0].orbit_depths.0[2] = 7;
+
+        let mut loaded = super::App::default();
+        loaded.restore_scene(&app.preset_values());
+        assert_eq!(loaded.fractal, Sierpinski);
+        assert_eq!(loaded.preset_values(), app.preset_values());
+        let uniforms = loaded.camera_uniforms([100.0; 2], None, [0.0; 4], true);
+        assert_eq!(uniforms[super::SIERPINSKI_UNIFORM_OFFSET], 14.0);
+        assert_eq!(uniforms[super::ORBIT_DEPTH_UNIFORM_OFFSET..super::FOUR_BRANCH_UNIFORM_OFFSET], [-6.0, 3.0, -1.0, -3.0]);
+        assert_eq!(loaded.mutation.field_uniforms(Mandelbox, 0.5)[2], 3.0);
+        assert_eq!(loaded.extra_mutations[0].field_uniforms(Sierpinski, 0.5)[4], 3.0);
+
+        loaded.restore_scene(&super::App::default().preset_values()[..super::PRESET_SIERPINSKI_FIELDS]);
+        assert_eq!(loaded.sierpinski, super::SierpinskiParameters::default());
+        assert_eq!(loaded.orbit_depths, super::OrbitDepths::default());
+    }
+
+    #[test]
+    fn four_branch_parameters_survive_presets_and_reach_the_shader() {
+        use super::{App, FourBranchParameters, Fractal, MutationStage};
+        let parameters = FourBranchParameters { depth: 14, thickness: 0.13, spread: 1.2, twist: -45.0 };
+        let mut app = App::default();
+        app.select_fractal(Fractal::FourBranch);
+        app.four_branch = parameters;
+        let mut restored = App::default();
+        restored.restore_scene(&app.preset_values());
+        assert_eq!(restored.fractal, Fractal::FourBranch);
+        assert_eq!(restored.four_branch, parameters);
+        let uniforms = restored.camera_uniforms([100.0; 2], None, [0.0; 4], true);
+        let offset = super::FOUR_BRANCH_UNIFORM_OFFSET;
+        assert_eq!(uniforms[offset..offset + 5], parameters.uniforms());
+
+        app.fractal = Fractal::Sierpinski;
+        app.mutation.formula = Some(Fractal::FourBranch);
+        app.mutation.four_branch = parameters;
+        app.extra_mutations.push(MutationStage { four_branch: parameters, ..MutationStage::default() });
+        restored.restore_scene(&app.preset_values());
+        assert_eq!(restored.mutation.field_uniforms(Fractal::FourBranch, 0.5)[4..9], parameters.uniforms());
+        assert_eq!(restored.extra_mutations[0].four_branch, parameters);
+
+        let old_preset = app.preset_values();
+        restored.restore_scene(&old_preset[..super::PRESET_FOUR_BRANCH_FIELDS]);
+        assert_eq!(restored.fractal, Fractal::Sierpinski);
+        assert_eq!(restored.four_branch, FourBranchParameters::default());
+        assert_eq!(restored.mutation.four_branch, FourBranchParameters::default());
     }
 
     #[test]
@@ -2809,7 +3686,7 @@ mod tests {
         original.effects.dof_enabled = true;
         original.contrast = 2.5;
         original.quality = 8.0;
-        original.normal_smoothing = 0.000020;
+        original.normal_smoothing = 0.0;
         original.fractal = super::Fractal::Menger;
         original.menger_parameters.depth = 14;
         original.menger_parameters.tunnel_width = 1.15;
@@ -2861,7 +3738,8 @@ mod tests {
             assert_eq!(uniforms[34], 0.0);
             assert_eq!(uniforms[24..28], [0.18, 0.38, 0.58, 1.0]);
             assert_eq!(uniforms[31], 0.0);
-            assert_eq!(uniforms[super::SURFACE_UNIFORM_OFFSET..], [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+            assert_eq!(uniforms[super::SURFACE_UNIFORM_OFFSET..super::SIERPINSKI_UNIFORM_OFFSET],
+                [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
         }
         let mut legacy_lighting = super::App::default();
         legacy_lighting.restore_scene(&original.preset_values()[..super::PRESET_LIGHT_FLAGS]);
@@ -2879,7 +3757,7 @@ mod tests {
         assert_eq!(loaded.effects.preset(), original.effects.preset());
         assert_eq!(loaded.contrast, 2.5);
         assert_eq!(loaded.quality, 8.0);
-        assert_eq!(loaded.normal_smoothing, 0.000020);
+        assert_eq!(loaded.normal_smoothing, 0.0);
         assert_eq!(loaded.fractal, super::Fractal::Menger);
         assert_eq!(loaded.menger_parameters, original.menger_parameters);
         assert_eq!(loaded.background_color, original.background_color);
@@ -2942,8 +3820,13 @@ mod tests {
         std::fs::write(path, lines[..95].join("\n")).unwrap();
         loaded.load_preset(path);
         assert_eq!(loaded.preset_status, "Preset loaded");
-        assert_eq!(loaded.fold_parameters, original.fold_parameters);
-        assert_eq!(loaded.mutation, original.mutation);
+        assert_eq!(loaded.fold_parameters.kifs, original.fold_parameters.kifs);
+        assert_eq!(loaded.fold_parameters.amazing_surface, original.fold_parameters.amazing_surface);
+        assert_eq!(loaded.fold_parameters.pseudo_kleinian, super::FoldParameters::LEGACY_KLEINIAN_DEFAULTS);
+        assert_eq!(loaded.mutation.values(), original.mutation.values());
+        assert_eq!(loaded.mutation.fold_parameters.kifs, original.mutation.fold_parameters.kifs);
+        assert_eq!(loaded.mutation.fold_parameters.amazing_surface, original.mutation.fold_parameters.amazing_surface);
+        assert_eq!(loaded.mutation.fold_parameters.pseudo_kleinian, super::FoldParameters::LEGACY_KLEINIAN_DEFAULTS);
         restored.fractal = super::Fractal::PseudoKleinian;
         restored.lighting.enabled = true;
         restored.lighting.shadows = false;
@@ -2999,8 +3882,10 @@ mod tests {
         loaded.load_preset(path);
         assert_eq!(loaded.preset_status, "Preset loaded");
         assert_eq!(loaded.fractal, original.fractal);
-        assert_eq!(loaded.mutation, original.mutation);
-        assert_eq!(loaded.fold_parameters, super::FoldParameters::default());
+        let legacy_folds = super::FoldParameters::from_preset(&[], &[]);
+        assert_eq!(loaded.fold_parameters, legacy_folds);
+        assert_eq!(loaded.mutation.fold_parameters, legacy_folds);
+        assert_eq!(loaded.mutation.values(), original.mutation.values());
 
         std::fs::write(path, lines[..74].join("\n")).unwrap();
         loaded.load_preset(path);
@@ -3041,7 +3926,7 @@ mod tests {
         assert_eq!(loaded.camera.look_roll, 0.0);
         assert_eq!(loaded.effects.preset(), original.effects.preset());
         assert_eq!(loaded.contrast, 1.6);
-        assert_eq!(loaded.mandelbox_parameters, super::MandelboxParameters::default());
+        assert_eq!(loaded.mandelbox_parameters.scale, super::MandelboxParameters::LEGACY_SCALE);
         legacy[43] = "0";
         std::fs::write(path, legacy.join("\n")).unwrap();
         loaded.load_preset(path);
@@ -3060,25 +3945,43 @@ mod tests {
 
     #[test]
     fn fractal_shader_parses_and_validates() {
-        let source = super::FRACTAL_SHADER;
-        let module = naga::front::wgsl::parse_str(source)
-            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+        for source in [super::FRACTAL_SHADER, include_str!("viewport_metrics.wgsl")] {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+        }
     }
 
     #[test]
     fn progressive_pipelines_validate_on_gpu() {
-        let instance = wgpu::Instance::default();
+        check_progressive_pipelines(false);
+    }
+
+    #[test]
+    #[ignore = "GPU benchmark with multiple scene and resolution combinations"]
+    fn benchmark_adaptive_viewport() {
+        check_progressive_pipelines(true);
+    }
+
+    fn check_progressive_pipelines(benchmark: bool) {
+        let instance = if benchmark {
+            wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..Default::default() })
+        } else {
+            wgpu::Instance::default()
+        };
         let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
             eprintln!("No GPU adapter available; skipping GPU validation");
             return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).expect("GPU device");
+        let required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        if benchmark {
+            println!("Benchmark adapter: {:?}; timestamp query: {}", adapter.get_info(),
+                required_features.contains(wgpu::Features::TIMESTAMP_QUERY));
+            assert!(required_features.contains(wgpu::Features::TIMESTAMP_QUERY), "GPU timestamps unavailable");
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features, ..Default::default() }, None)).expect("GPU device");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fractal test"), source: wgpu::ShaderSource::Wgsl(super::FRACTAL_SHADER.into()),
         });
@@ -3107,7 +4010,8 @@ mod tests {
         let mut values = [0.0f32; super::CAMERA_UNIFORM_FLOATS];
         values[2] = 3.2; values[3] = 1.0; values[8] = 8.0; values[10] = 8.0; values[17] = 0.002; values[18] = 1.0; values[20] = 2.0;
         let environment = super::hdri::upload(&device, &queue, 1, 1, &[0.0; 3]);
-        let (focus_pipeline, focus_bind) = super::Renderer::create_focus_pipeline(&device, &shader, &camera, &environment);
+        let blue_noise = super::pixel_sampling::blue_noise_view(&device, &queue);
+        let (focus_pipeline, focus_bind) = super::Renderer::create_focus_pipeline(&device, &shader, &camera, &environment, &blue_noise);
         let depth = super::Renderer::pick_focus(&device, &queue, &camera, &focus_pipeline, &focus_bind, values, [0.0, 0.0]);
         assert!(matches!(depth, Some(d) if d > 1.0 && d < 3.2), "unexpected focus depth: {depth:?}");
         assert!(super::Renderer::pick_focus(&device, &queue, &camera, &focus_pipeline, &focus_bind, values, [1.0, 1.0]).is_none());
@@ -3132,7 +4036,7 @@ mod tests {
         values[40..43].copy_from_slice(&[1.8, 1.5, 0.025]);
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
         queue.write_buffer(&camera, 0, &bytes);
-        let camera_bind = super::hdri::bind(&device, &pipeline.get_bind_group_layout(0), &camera, &environment);
+        let camera_bind = super::hdri::bind(&device, &pipeline.get_bind_group_layout(0), &camera, &environment, &blue_noise);
         let output = device.create_texture(&wgpu::TextureDescriptor {
             label: None, size: wgpu::Extent3d { width: 8, height: 8, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
@@ -3164,5 +4068,100 @@ mod tests {
         }
         queue.submit(Some(encoder.finish()));
         let _ = device.poll(wgpu::Maintain::Wait);
+        if required_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            let sizes = if benchmark && std::env::var_os("MENGERVIBES_BENCHMARK_1080P").is_some() {
+                [1920u32, 1080u32]
+            } else {
+                [640, 360]
+            };
+            let (preview, _) = super::Renderer::create_accumulation(&device, &composite_pipeline, &camera, sizes[0], sizes[1]);
+            let view = preview.create_view(&Default::default());
+            let timing = super::adaptive_viewport::GpuTiming::new(&device, &queue);
+            let measure = |app: &super::App, divisor: u32, adaptive: bool| {
+                let [width, height] = sizes.map(|side| side.div_ceil(divisor));
+                let mut uniforms = app.camera_uniforms(sizes.map(|side| side as f32), None, [0.0; 4], false);
+                if adaptive || divisor != 1 {
+                    uniforms[53] = width as f32;
+                    uniforms[54] = height as f32;
+                }
+                if adaptive {
+                    uniforms[super::FULL_PRECISION_PREVIEW_UNIFORM] = sizes[1] as f32;
+                    uniforms[18] = (app.quality * 1.25).min(4.0).max(app.quality);
+                } else {
+                    uniforms[10] /= divisor as f32;
+                }
+                let bytes: Vec<u8> = uniforms.iter().flat_map(|value| value.to_ne_bytes()).collect();
+                queue.write_buffer(&camera, 0, &bytes);
+                let mut encoder = device.create_command_encoder(&Default::default());
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Adaptive navigation comparison"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view, resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })], depth_stencil_attachment: None, timestamp_writes: Some(timing.writes()), occlusion_query_set: None,
+                });
+                pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &camera_bind, &[]);
+                pass.set_blend_constant(wgpu::Color::WHITE);
+                pass.draw(0..3, 0..1);
+                drop(pass);
+                timing.resolve(&mut encoder, &device, &preview, &camera);
+                queue.submit(Some(encoder.finish()));
+                let pending = super::adaptive_viewport::InFlight::submit(&queue, Some(&timing), Some(super::adaptive_viewport::PreviewWork {
+                    size: [width, height], divisor, samples: 1,
+                }));
+                let _ = device.poll(wgpu::Maintain::Wait);
+                let stats = pending.poll(Some(&timing)).flatten().expect("completed benchmark pass");
+                assert!(stats.gpu && stats.ms > 0.0);
+                assert!(stats.valid_fraction.is_some_and(|fraction| (0.0..=1.0).contains(&fraction)));
+                stats
+            };
+            let mut app = super::App::default();
+            app.lighting.shadows = false;
+            let stats = measure(&app, 4, true);
+            assert_eq!(stats.size, sizes.map(|side| side.div_ceil(4)));
+            assert!(stats.valid_fraction.unwrap() > 0.9);
+            if benchmark {
+                use super::{Camera, Fractal, MutationStage};
+                println!("{}×{} target; 1 primary ray/pixel; AO and shadows off", sizes[0], sizes[1]);
+                for (name, base, position, mutations, path_traced) in [
+                    ("Menger exterior", Fractal::Menger, None, &[][..], false),
+                    ("Mandelbox exterior", Fractal::Mandelbox, None, &[][..], false),
+                    ("Bulb exterior", Fractal::Mandelbulb, None, &[][..], false),
+                    ("Bulb interior", Fractal::Mandelbulb, Some([0.0; 3]), &[][..], false),
+                    ("Menger tunnel", Fractal::Menger, Some([0.0, 0.5, 0.0]), &[][..], false),
+                    ("Bulb + Box", Fractal::Mandelbulb, None, &[Fractal::Mandelbox][..], false),
+                    ("Bulb + three fields", Fractal::Mandelbulb, None, &[Fractal::Mandelbox, Fractal::AmazingSurface, Fractal::Menger][..], false),
+                    ("Interior + paths", Fractal::Mandelbulb, Some([0.0; 3]), &[Fractal::Mandelbox, Fractal::Menger][..], true),
+                ] {
+                    app.fractal = base;
+                    app.lighting.path_traced = path_traced;
+                    app.camera = Camera::framed_view(base);
+                    if let Some(position) = position { app.camera.position = position; }
+                    app.mutation = MutationStage::default();
+                    app.extra_mutations.clear();
+                    for &formula in mutations {
+                        app.extra_mutations.push(MutationStage { formula: Some(formula), ..Default::default() });
+                    }
+                    let legacy = if mutations.is_empty() { 1 } else { 4 };
+                    for (label, divisor, adaptive) in [("Legacy", legacy, false), ("Quarter", 4, true), ("Half", 2, true), ("Full", 1, true)] {
+                        let mut samples = Vec::new();
+                        let yaw = app.camera.yaw;
+                        for offset in [0.0, 0.26, -0.31, 0.0, 0.26, -0.31] {
+                            app.camera.yaw = yaw + offset;
+                            samples.push(measure(&app, divisor, adaptive));
+                        }
+                        app.camera.yaw = yaw;
+                        samples.drain(..3);
+                        samples.sort_by(|a, b| a.ms.total_cmp(&b.ms));
+                        let median = &samples[1];
+                        let valid = median.valid_fraction.unwrap();
+                        println!("{name:22} {label:7} {:6.2} ms {:6.1}% valid {:5.2} M valid primary rays/s | {:.3} ms GPU metrics | {:.2} ms completion",
+                            median.ms, valid * 100.0, valid * median.rays as f64 / (median.ms * 1000.0),
+                            median.metrics_ms.unwrap_or_default(), median.completion_ms);
+                    }
+                }
+            }
+        }
     }
 }

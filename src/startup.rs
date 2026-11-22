@@ -154,6 +154,86 @@ mod tests {
         platform::windows::EventLoopBuilderExtWindows,
     };
 
+    fn compare_navigation(renderer: &mut crate::Renderer, ctx: &egui::Context, extent: [u32; 2]) -> Result<(), String> {
+        use crate::{App, Camera, Fractal, MutationStage, adaptive_viewport::{AdaptiveViewport, PreviewWork}};
+
+        let mut app = App::default();
+        app.lighting.shadows = false;
+        app.lighting.bounces = 1;
+        let mut capture = |app: &App, divisor: u32, adaptive: bool, reference: bool, frame: u32| -> Result<_, String> {
+            let progress = reference.then_some(0);
+            let mut data = app.camera_uniforms(extent.map(|side| side as f32), progress, [0.0; 4], false);
+            let size = extent.map(|side| side.div_ceil(divisor));
+            if !reference {
+                data[crate::MOVING_SAMPLES_UNIFORM] = 1.0;
+                data[crate::MOVING_BOUNCES_UNIFORM] = 1.0;
+                data[crate::NAVIGATION_SAMPLE_UNIFORM] = frame as f32;
+            }
+            let work = (adaptive && !reference).then_some(PreviewWork { size, divisor, samples: 1 });
+            if work.is_some() { data[18] = (app.quality * 1.25).min(4.0).max(app.quality); }
+            let gui = ctx.run(egui::RawInput::default(), |_| {});
+            let start = Instant::now();
+            let image = renderer.render(data, progress, reference, None, size, gui, ctx, true, adaptive, work)
+                .ok_or("Navigation capture unavailable")??;
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            let stats = renderer.poll_viewport_work().flatten();
+            let small = image::imageops::resize(&image, 10, 6, image::imageops::FilterType::Triangle);
+            Ok((small, ms, stats))
+        };
+        let coarse_error = |a: &image::RgbaImage, b: &image::RgbaImage| {
+            a.pixels().zip(b.pixels()).flat_map(|(a, b)| (0..3).map(move |i| f64::from(a[i].abs_diff(b[i])))).sum::<f64>()
+                / (f64::from(a.width() * a.height()) * 3.0)
+        };
+        for (name, formula, mutations, interior) in [
+            ("Menger exterior", Fractal::Menger, &[][..], false),
+            ("Mandelbox exterior", Fractal::Mandelbox, &[][..], false),
+            ("Mandelbulb exterior", Fractal::Mandelbulb, &[][..], false),
+            ("Bulb + three mutations", Fractal::Mandelbulb, &[Fractal::Mandelbox, Fractal::AmazingSurface, Fractal::Menger][..], false),
+            ("Interior + paths", Fractal::Mandelbulb, &[Fractal::Mandelbox, Fractal::Menger][..], true),
+        ] {
+            app.fractal = formula;
+            app.camera = Camera::framed_view(formula);
+            app.lighting.path_traced = interior;
+            if interior { app.camera.position = [0.0; 3]; }
+            app.extra_mutations = mutations.iter().map(|&formula| MutationStage { formula: Some(formula), ..Default::default() }).collect();
+            let legacy_divisor = if mutations.is_empty() { 1 } else { 4 };
+            let mut scheduler = AdaptiveViewport::default();
+            let mut elapsed = [Vec::new(), Vec::new()];
+            let mut errors = [0.0; 2];
+            let mut acceptable = [0; 2];
+            let mut levels = Vec::new();
+            let mut previous = None;
+            let mut pose_changes = 0;
+            let yaw = app.camera.yaw;
+            // Warm up both paths, then alternate large turns within one session.
+            capture(&app, legacy_divisor, false, false, 0)?;
+            capture(&app, 4, true, false, 0)?;
+            for (frame, offset) in [0.0, 0.43, -0.35, 0.64, -0.19].into_iter().enumerate() {
+                app.camera.yaw = yaw + offset;
+                let (reference, _, _) = capture(&app, 1, false, true, 0)?;
+                let (legacy, legacy_ms, _) = capture(&app, legacy_divisor, false, false, frame as u32)?;
+                let divisor = scheduler.divisor();
+                let (adaptive, adaptive_ms, stats) = capture(&app, divisor, true, false, frame as u32)?;
+                levels.push(divisor);
+                scheduler.observe(stats.ok_or("Adaptive navigation did not report completion")?);
+                if previous.as_ref().is_some_and(|prior| prior != &adaptive) { pose_changes += 1; }
+                previous = Some(adaptive.clone());
+                elapsed[0].push(legacy_ms);
+                elapsed[1].push(adaptive_ms);
+                for (i, image) in [legacy, adaptive].iter().enumerate() {
+                    let error = coarse_error(image, &reference);
+                    errors[i] += error / 5.0;
+                    acceptable[i] += usize::from(error <= 12.0);
+                }
+            }
+            for times in &mut elapsed { times.sort_by(f64::total_cmp); }
+            if pose_changes < 2 { return Err(format!("{name}: the adaptive preview did not track the scripted turns")); }
+            println!("{name} turns: median capture {:.1}/{:.1} ms; coarse RGB error {:.2}/{:.2}; below threshold {}/5 and {}/5 (legacy/adaptive); divisors {levels:?}",
+                elapsed[0][2], elapsed[1][2], errors[0], errors[1], acceptable[0], acceptable[1]);
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "Requires a Windows desktop and a graphics adapter"]
     fn starts_renderer_on_worker_with_windows_event_loop_running() {
@@ -201,41 +281,142 @@ mod tests {
                             renderer.device.push_error_scope(wgpu::ErrorFilter::Validation);
                             let tiles = renderer.config.width.div_ceil(crate::REFINE_TILE_WIDTH)
                                 * renderer.config.height.div_ceil(crate::REFINE_TILE_HEIGHT);
-                            let mut capture = |progress, tile, divisor| -> Result<image::RgbaImage, String> {
-                                let data = app.camera_uniforms(size, progress, [0.0; 4], false);
+                            let mut capture = |progress: Option<u32>, tile, divisor, adaptive| -> Result<image::RgbaImage, String> {
+                                let _ = renderer.poll_viewport_work();
+                                let mut data = app.camera_uniforms(size, progress, [0.0; 4], false);
                                 let gui = ctx.run(egui::RawInput::default(), |_| {});
-                                renderer.render(data, progress, progress.is_some(), tile, extent.map(|side| side.div_ceil(divisor)), gui, &ctx, true)
+                                let render_size = extent.map(|side| side.div_ceil(divisor));
+                                let preview = (adaptive && progress.is_none()).then_some(crate::adaptive_viewport::PreviewWork {
+                                    size: render_size, divisor, samples: 1,
+                                });
+                                if preview.is_some() { data[18] = (app.quality * 1.25).min(4.0).max(app.quality); }
+                                renderer.render(data, progress, progress.is_some(), tile, render_size, gui, &ctx, true, adaptive, preview)
                                     .ok_or_else(|| "Viewport capture unavailable".to_string())?
                             };
-                            let preview = capture(None, None, 4)?;
-                            let mut refined = capture(Some(0), Some(0..1), 1)?;
+                            let legacy_preview = capture(None, None, 4, false)?;
+                            let preview = capture(None, None, 4, true)?;
+                            let mut refined = capture(Some(0), Some(0..1), 1, true)?;
                             if tiles > 1 && refined != preview {
                                 return Err("The preview changed before the first sample completed".into());
                             }
-                            if tiles > 1 { refined = capture(Some(0), Some(1..tiles), 1)?; }
-                            if refined != capture(Some(0), None, 1)? {
+                            if tiles > 1 { refined = capture(Some(0), Some(1..tiles), 1, true)?; }
+                            if refined != capture(Some(0), None, 1, false)? {
                                 return Err("Tiled refinement differs from a full pass".into());
                             }
                             let reduced = image::imageops::resize(&preview, 10, 6, image::imageops::FilterType::Triangle);
+                            let old = image::imageops::resize(&legacy_preview, 10, 6, image::imageops::FilterType::Triangle);
                             let still = image::imageops::resize(&refined, 10, 6, image::imageops::FilterType::Triangle);
-                            let mean_difference = reduced.as_raw().iter().zip(still.as_raw())
-                                .map(|(a, b)| f32::from(a.abs_diff(*b))).sum::<f32>() / reduced.as_raw().len() as f32;
+                            let difference = |image: &image::RgbaImage| image.as_raw().chunks_exact(4).zip(still.as_raw().chunks_exact(4))
+                                .flat_map(|(a, b)| (0..3).map(move |channel| f32::from(a[channel].abs_diff(b[channel]))))
+                                .sum::<f32>() / (image.width() * image.height() * 3) as f32;
+                            let mean_difference = difference(&reduced);
+                            println!("Mandelbox + Menger at 300×180, coarse RGB error (0–255): legacy {:.2}, adaptive {mean_difference:.2}", difference(&old));
                             if mean_difference > 26.0 {
                                 return Err(format!("Menger blend lost its overall structure during navigation ({mean_difference:.1})"));
                             }
-                            app.effects.dof_enabled = true;
+                            let _ = renderer.poll_viewport_work();
+                            crate::intelligent_sampling::compare_viewport_sampling(&mut renderer, &ctx, &mut app, extent)?;
+                            compare_navigation(&mut renderer, &ctx, extent)?;
+                            let settings = crate::noise_sampling::Settings { enabled: true, threshold: 0.01, min_samples: 2 };
+                            renderer.noise_plan = settings.plan(8);
+                            let noise_pipelines = renderer.noise_pipelines.get_or_init(|| crate::noise_sampling::Pipelines::new(&renderer.device, false));
+                            noise_pipelines.sample_pipeline(&renderer.device, &renderer.camera_layout, false);
+                            let mut empty = crate::App::default();
+                            empty.camera.position = [100.0; 3];
+                            empty.camera.yaw = 0.0;
+                            empty.camera.pitch = 0.0;
+                            for index in 0..2 {
+                                let data = empty.camera_uniforms(size, Some(index), [0.0; 4], false);
+                                let gui = ctx.run(egui::RawInput::default(), |_| {});
+                                renderer.render(data, Some(index), true, None, extent, gui, &ctx, true, false, None)
+                                    .ok_or("Adaptive viewport capture unavailable")??;
+                            }
+                            renderer.poll_noise_sampling();
+                            if renderer.noise_remaining != Some(0)
+                                || renderer.noise_tiles.as_ref().is_none_or(|tiles| tiles.len() != 0)
+                            {
+                                return Err("The uniform background did not converge after two samples".into());
+                            }
+                            renderer.noise_remaining = None;
+                            renderer.noise_tiles = None;
+                            empty.camera.position = [0.0, 0.0, 10.0];
+                            empty.effects.dof_enabled = true;
+                            empty.effects.aperture = 0.04;
+                            empty.effects.focus = 2.0;
+                            for index in 0..2 {
+                                let data = empty.camera_uniforms(size, Some(index), [0.0; 4], false);
+                                let gui = ctx.run(egui::RawInput::default(), |_| {});
+                                renderer.render(data, Some(index), true, None, extent, gui, &ctx, true, false, None)
+                                    .ok_or("Adaptive viewport capture unavailable")??;
+                            }
+                            renderer.poll_noise_sampling();
+                            let [columns, rows] = crate::noise_sampling::viewport_tile_grid(extent);
+                            let total = columns * rows;
+                            let tiles = renderer.noise_tiles.take().ok_or("No active viewport tiles reported")?;
+                            if !(1..total).contains(&tiles.len()) {
+                                return Err(format!("The viewport did not isolate noisy tiles: {} of {total} remain", tiles.len()));
+                            }
+                            let render_pass = |renderer: &mut crate::Renderer| -> Result<_, String> {
+                                let tile_count = renderer.noise_tiles.as_ref().map_or(total, crate::noise_sampling::ActiveTiles::len);
+                                let start = Instant::now();
+                                let mut submissions = 0;
+                                let mut cursor = 0;
+                                while cursor < tile_count {
+                                    let end = renderer.noise_tiles.as_ref().map_or(cursor + 1, |active| active.batch_end(cursor, 1));
+                                    let data = empty.camera_uniforms(size, Some(2), [0.0; 4], false);
+                                    let gui = ctx.run(egui::RawInput::default(), |_| {});
+                                    let capture = end == tile_count;
+                                    let result = renderer.render(data, Some(2), true, Some(cursor..end), extent, gui, &ctx, capture, false, None);
+                                    if capture { result.ok_or("Adaptive viewport frame unavailable")??; }
+                                    if !renderer.frame_submitted { return Err("Adaptive pass was not submitted".into()); }
+                                    submissions += 1;
+                                    cursor = end;
+                                }
+                                Ok((submissions, start.elapsed().as_secs_f64() * 1000.0))
+                            };
+                            let active_count = tiles.len();
+                            let mut active = Some(tiles);
+                            let mut old_times = Vec::new();
+                            let mut new_times = Vec::new();
+                            let mut old_submissions = 0;
+                            let mut new_submissions = 0;
+                            for _ in 0..4 {
+                                renderer.noise_tiles = None;
+                                let (old_count, old_ms) = render_pass(&mut renderer)?;
+                                renderer.noise_tiles = active.take();
+                                let (new_count, new_ms) = render_pass(&mut renderer)?;
+                                active = renderer.noise_tiles.take();
+                                old_submissions = old_count;
+                                new_submissions = new_count;
+                                old_times.push(old_ms);
+                                new_times.push(new_ms);
+                            }
+                            old_times.sort_by(f64::total_cmp);
+                            new_times.sort_by(f64::total_cmp);
+                            if new_submissions >= old_submissions { return Err("Sparse viewport work did not reduce submissions".into()); }
+                            println!("Viewport: {active_count}/{total} active tiles, {old_submissions} to {new_submissions} frame submissions; {:.1} to {:.1} ms per pass",
+                                (old_times[1] + old_times[2]) * 0.5, (new_times[1] + new_times[2]) * 0.5);
+                            renderer.noise_plan = None;
+                            renderer.noise_remaining = None;
+                            renderer.noise_tiles = None;
                             app.effects.aperture = 0.04;
                             app.effects.focus = 0.15;
-                            let mut capture_dof = |sample, advance| -> Result<image::RgbaImage, String> {
+                            let mut capture_dof = |app: &crate::App, sample, advance| -> Result<image::RgbaImage, String> {
                                 let progress = Some(sample);
                                 let data = app.camera_uniforms(size, progress, [0.0; 4], false);
                                 let gui = ctx.run(egui::RawInput::default(), |_| {});
-                                renderer.render(data, progress, advance, None, extent, gui, &ctx, true)
+                                renderer.render(data, progress, advance, None, extent, gui, &ctx, true, false, None)
                                     .ok_or_else(|| "Depth of field preview unavailable".to_string())?
                             };
-                            let pinhole = capture_dof(0, true)?;
-                            let blurred = capture_dof(1, true)?;
-                            if pinhole == blurred || capture_dof(2, false)? != blurred {
+                            app.effects.dof_enabled = false;
+                            let pinhole = capture_dof(&app, 0, true)?;
+                            app.effects.dof_enabled = true;
+                            let first_lens_sample = capture_dof(&app, 0, true)?;
+                            if pinhole == first_lens_sample {
+                                return Err("The first viewport sample did not use the camera aperture".into());
+                            }
+                            let blurred = capture_dof(&app, 1, true)?;
+                            if first_lens_sample == blurred || capture_dof(&app, 2, false)? != blurred {
                                 return Err("The full-resolution DOF preview did not accumulate or retain its samples".into());
                             }
                             let mut ao_scene = crate::App::default();
@@ -250,7 +431,7 @@ mod tests {
                                 let reduced_extent = extent.map(|side| side.div_ceil(2));
                                 let data = ao_scene.camera_uniforms(size, Some(0), [0.0; 4], false);
                                 let gui = ctx.run(egui::RawInput::default(), |_| {});
-                                renderer.render(data, Some(0), true, None, reduced_extent, gui, &ctx, true)
+                                renderer.render(data, Some(0), true, None, reduced_extent, gui, &ctx, true, false, None)
                                     .ok_or_else(|| "Ray-traced AO preview unavailable".to_string())?
                             };
                             if capture_ao(false)? == capture_ao(true)? {
@@ -264,7 +445,7 @@ mod tests {
                                 let progress = Some(sample);
                                 let data = ao_scene.camera_uniforms(size, progress, [0.0; 4], false);
                                 let gui = ctx.run(egui::RawInput::default(), |_| {});
-                                renderer.render(data, progress, true, None, extent.map(|side| side.div_ceil(2)), gui, &ctx, true)
+                                renderer.render(data, progress, true, None, extent.map(|side| side.div_ceil(2)), gui, &ctx, true, false, None)
                                     .ok_or_else(|| "Path-traced preview unavailable".to_string())?
                             };
                             let uniform = capture_path(0, 0)?;
@@ -277,7 +458,7 @@ mod tests {
                                 data[crate::MOVING_SAMPLES_UNIFORM] = samples;
                                 data[crate::MOVING_BOUNCES_UNIFORM] = bounces;
                                 let gui = ctx.run(egui::RawInput::default(), |_| {});
-                                renderer.render(data, None, false, None, extent.map(|side| side.div_ceil(4)), gui, &ctx, true)
+                                renderer.render(data, None, false, None, extent.map(|side| side.div_ceil(4)), gui, &ctx, true, false, None)
                                     .ok_or_else(|| "Moving viewport preview unavailable".to_string())?
                             };
                             let four_samples = capture_moving(4.0, 1.0)?;
@@ -287,36 +468,81 @@ mod tests {
                             if capture_moving(4.0, 4.0)? == four_samples {
                                 return Err("Moving viewport bounce count did not change the preview".into());
                             }
+                            let mut pixel_previews = Vec::new();
+                            for mode in crate::pixel_sampling::PixelSampling::ALL {
+                                ao_scene.pixel_sampling = mode;
+                                let data = ao_scene.camera_uniforms(size, None, [0.0; 4], false);
+                                let gui = ctx.run(egui::RawInput::default(), |_| {});
+                                let image = renderer.render(data, None, false, None,
+                                    extent.map(|side| side.div_ceil(4)), gui, &ctx, true, false, None)
+                                    .ok_or_else(|| "Pixel sampling preview unavailable".to_string())??;
+                                if pixel_previews.contains(&image) {
+                                    return Err(format!("{} did not affect the viewport", mode.label()));
+                                }
+                                pixel_previews.push(image);
+                            }
+                            ao_scene.pixel_sampling = crate::pixel_sampling::PixelSampling::R2;
                             let denoise_extent = extent.map(|side| side.div_ceil(2));
                             let capture_denoise = |renderer: &mut crate::Renderer, sample, advance| -> Result<image::RgbaImage, String> {
                                 let progress = Some(sample);
                                 let data = ao_scene.camera_uniforms(size, progress, [0.0; 4], false);
                                 let gui = ctx.run(egui::RawInput::default(), |_| {});
-                                renderer.render(data, progress, advance, None, denoise_extent, gui, &ctx, true)
+                                renderer.render(data, progress, advance, None, denoise_extent, gui, &ctx, true, false, None)
                                     .ok_or_else(|| "Denoised viewport unavailable".to_string())?
                             };
                             for backend in [crate::denoise::Backend::Cpu, crate::denoise::Backend::Gpu]
                                 .into_iter().filter(|backend| backend.available())
                             {
+                                crate::intelligent_sampling::wait_for_pipelines(&mut renderer, true)?;
+                                renderer.intelligent_sampling.enabled = true;
                                 renderer.viewport_denoise.configure(Some(backend), true);
-                                capture_denoise(&mut renderer, 0, true)?;
-                                let noisy = capture_denoise(&mut renderer, 1, true)?;
-                                let (done, finished) = std::sync::mpsc::channel();
-                                renderer.viewport_denoise.start(&renderer.device, &renderer.queue, &renderer.accumulation,
-                                    denoise_extent, move || { let _ = done.send(()); });
-                                finished.recv_timeout(Duration::from_secs(15)).map_err(|error| error.to_string())?;
-                                renderer.poll_viewport_denoise();
-                                let filtered = capture_denoise(&mut renderer, 2, false)?;
-                                if let Some(error) = &renderer.viewport_denoise.error {
-                                    return Err(error.clone());
+                                let start_denoiser = |renderer: &mut crate::Renderer, samples| {
+                                    let (done, finished) = std::sync::mpsc::channel();
+                                    renderer.viewport_denoise.start(&renderer.device, &renderer.queue, &renderer.accumulation,
+                                        denoise_extent, samples, 6, crate::viewport_denoise::DEFAULT_INTERVAL, move || { let _ = done.send(()); });
+                                    finished
+                                };
+                                let present_denoised = |renderer: &mut crate::Renderer, finished: std::sync::mpsc::Receiver<()>, samples, traced| -> Result<image::RgbaImage, String> {
+                                    finished.recv_timeout(Duration::from_secs(15)).map_err(|error| error.to_string())?;
+                                    renderer.poll_viewport_denoise();
+                                    if let Some(error) = &renderer.viewport_denoise.error { return Err(error.clone()); }
+                                    let image = capture_denoise(renderer, traced, false)?;
+                                    let timing = renderer.viewport_denoise.presented.as_ref()
+                                        .filter(|timing| timing.samples == samples && timing.traced_samples == traced)
+                                        .ok_or_else(|| format!("{} did not present {samples} spp with {traced} spp traced", backend.label()))?;
+                                    println!("{} | {} spp filtered, {} traced at presentation | readback {:.1} ms | prepare {:.1} ms | OIDN {:.1} ms | to present {:.1} ms",
+                                        backend.label(), timing.samples, timing.traced_samples, timing.readback_ms,
+                                        timing.preparation_ms, timing.oidn_ms, timing.presentation_ms);
+                                    Ok(image)
+                                };
+                                let noisy = capture_denoise(&mut renderer, 0, true)?;
+                                let first = start_denoiser(&mut renderer, 1);
+                                assert!(renderer.viewport_denoise.awaiting_first_preview());
+                                let early = present_denoised(&mut renderer, first, 1, 1)?;
+                                if noisy == early {
+                                    return Err(format!("{} did not filter the first viewport sample", backend.label()));
                                 }
-                                if noisy == filtered || renderer.viewport_denoise.display.is_none() {
-                                    return Err(format!("{} did not filter the viewport", backend.label()));
+                                for sample in 1..4 {
+                                    capture_denoise(&mut renderer, sample, true)?;
+                                }
+                                let intermediate = start_denoiser(&mut renderer, 4);
+                                assert!(!renderer.viewport_denoise.awaiting_first_preview());
+                                capture_denoise(&mut renderer, 4, true)?;
+                                if early != capture_denoise(&mut renderer, 5, true)? {
+                                    return Err("First filtered viewport was lost during refinement".into());
+                                }
+                                let intermediate = present_denoised(&mut renderer, intermediate, 4, 6)?;
+                                let finish = start_denoiser(&mut renderer, 6);
+                                let final_image = present_denoised(&mut renderer, finish, 6, 6)?;
+                                if early == intermediate || intermediate == final_image {
+                                    return Err(format!("{} did not refine the filtered viewport", backend.label()));
                                 }
                                 renderer.viewport_denoise.configure(None, true);
-                                if noisy != capture_denoise(&mut renderer, 2, false)? {
-                                    return Err("The original viewport was not restored after disabling denoising".into());
+                                let raw = capture_denoise(&mut renderer, 6, false)?;
+                                if raw == final_image || renderer.viewport_denoise.display.is_some() {
+                                    return Err("The final viewport was still filtered after disabling denoising".into());
                                 }
+                                renderer.intelligent_sampling.enabled = false;
                             }
                             match pollster::block_on(renderer.device.pop_error_scope()) {
                                 Some(error) => Err(error.to_string()),
@@ -331,6 +557,10 @@ mod tests {
             fn window_event(&mut self, _: &ActiveEventLoop, _: winit::window::WindowId, _: winit::event::WindowEvent) {}
 
             fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                if self.result.is_some() {
+                    event_loop.exit();
+                    return;
+                }
                 if Instant::now() >= self.deadline {
                     self.result = Some(Err(format!("Graphics startup stalled at: {}", self.startup.stage)));
                     event_loop.exit();

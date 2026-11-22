@@ -9,6 +9,8 @@ pub struct CameraEffects {
     pub focal: f32,
     pub aperture: f32,
     pub dof_enabled: bool,
+    pub aperture_blades: u32,
+    pub aperture_rotation: f32,
     pub focus: f32,
     pub fog_density: f32,
     pub fog_start: f32,
@@ -21,6 +23,8 @@ impl Default for CameraEffects {
             focal: DEFAULT_FOCAL_MM,
             aperture: 0.001,
             dof_enabled: false,
+            aperture_blades: 0,
+            aperture_rotation: 0.0,
             focus: 0.25,
             fog_density: 0.0,
             fog_start: 0.0,
@@ -73,6 +77,17 @@ impl CameraEffects {
         ]
     }
 
+    pub fn bokeh(&self) -> [f32; 2] {
+        [self.aperture_blades as f32, self.aperture_rotation]
+    }
+
+    pub fn restore_bokeh(&mut self, values: &[f32]) {
+        if let [blades, rotation] = values {
+            self.aperture_blades = if *blades >= 3.0 { (*blades as u32).min(16) } else { 0 };
+            self.aperture_rotation = rotation.clamp(-180.0, 180.0);
+        }
+    }
+
     pub fn from_preset(values: &[f32]) -> Self {
         let [focal, aperture, focus, fog_density, fog_start, r, g, b, rest @ ..] = values else {
             return Self::default();
@@ -85,6 +100,7 @@ impl CameraEffects {
             fog_density: fog_density.clamp(0.0, 20.0),
             fog_start: fog_start.clamp(0.0, 30.0),
             fog_color: [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)],
+            ..Self::default()
         }
     }
 }

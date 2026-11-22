@@ -39,9 +39,15 @@ struct Camera {
     path_display: vec4<f32>,
     surface_finish: vec4<f32>,
     surface_emission: vec4<f32>,
+    sierpinski: vec4<f32>,
+    orbit_depth: vec4<f32>,
+    four_branch: vec4<f32>,
+    four_branch_twist: vec4<f32>,
+    noise_sampling: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var panorama: texture_2d<f32>;
+@group(0) @binding(3) var panorama_importance: texture_2d<f32>;
 @vertex fn vs_main(@builtin(vertex_index) i: u32) -> VertexOut {
     var positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
     var out: VertexOut;
@@ -198,6 +204,84 @@ const MENGER: f32 = 2.0;
 const KIFS: f32 = 3.0;
 const AMAZING_SURFACE: f32 = 4.0;
 const PSEUDO_KLEINIAN: f32 = 5.0;
+const SIERPINSKI: f32 = 6.0;
+const FOUR_BRANCH: f32 = 7.0;
+
+const TETRAHEDRON_CORNERS = array(
+    vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(-1.0, -1.0, 1.0),
+    vec3<f32>(-1.0, 1.0, -1.0), vec3<f32>(1.0, -1.0, -1.0),
+);
+
+fn tetrahedron_projections(p: vec3<f32>) -> vec4<f32> {
+    return vec4<f32>(dot(p, TETRAHEDRON_CORNERS[0]), dot(p, TETRAHEDRON_CORNERS[1]),
+        dot(p, TETRAHEDRON_CORNERS[2]), dot(p, TETRAHEDRON_CORNERS[3]));
+}
+
+fn sierpinski_distance(p: vec3<f32>, depth: u32) -> f32 {
+    let inv_sqrt3 = inverseSqrt(3.0);
+    // Rotate the canonical tetrahedron so a vertex points up and the base lies flat.
+    var point = p.x * vec3<f32>(1.0, 0.0, -1.0) * inverseSqrt(2.0)
+        + p.y * vec3<f32>(1.0) * inv_sqrt3
+        + p.z * vec3<f32>(1.0, -2.0, 1.0) * inverseSqrt(6.0);
+    var scale = 1.0;
+    for (var level = 0u; level < depth; level++) {
+        // The four half-size copies are symmetric across their Voronoi boundaries.
+        // Map the nearest corner copy back to the full-size tetrahedron.
+        let projection = tetrahedron_projections(point);
+        let first = select(TETRAHEDRON_CORNERS[1], TETRAHEDRON_CORNERS[0], projection.x >= projection.y);
+        let second = select(TETRAHEDRON_CORNERS[3], TETRAHEDRON_CORNERS[2], projection.z >= projection.w);
+        let corner = select(second, first, max(projection.x, projection.y) >= max(projection.z, projection.w));
+        point = 2.0 * point - corner;
+        scale *= 0.5;
+    }
+    // The maximum signed face-plane distance is a conservative step outside.
+    let projection = tetrahedron_projections(point);
+    return (-min(min(projection.x, projection.y), min(projection.z, projection.w)) - 1.0) * inv_sqrt3 * scale;
+}
+
+fn four_branch_distance(p: vec3<f32>, settings: vec4<f32>, sine: f32) -> f32 {
+    let depth = min(u32(settings.x), 14u);
+    let thickness = settings.y;
+    let spread = settings.z;
+    let cosine = settings.w;
+    let shrink = 0.34;
+    let child_radius = spread * shrink / (1.0 - shrink);
+    let unit = inverseSqrt(3.0);
+    var point = p;
+    var scale = 1.0;
+    var twist = -sine;
+    var distance = 1e20;
+    for (var level = 0u; level <= depth; level++) {
+        // Equal arm lengths make the largest projection the nearest capsule.
+        let projection = tetrahedron_projections(point);
+        let first = max(projection.x, projection.y);
+        let second = max(projection.z, projection.w);
+        let axis_a = select(TETRAHEDRON_CORNERS[1], TETRAHEDRON_CORNERS[0], projection.x >= projection.y);
+        let axis_b = select(TETRAHEDRON_CORNERS[3], TETRAHEDRON_CORNERS[2], projection.z >= projection.w);
+        let axis = select(axis_b, axis_a, first >= second) * unit;
+        let axial = max(first, second) * unit;
+        distance = min(distance, scale * (length(point - axis * clamp(axial, 0.0, spread)) - thickness));
+        if (level == depth) { break; }
+
+        let from_tip = point - spread * axis;
+        let nearest_bound = scale * (length(from_tip) - child_radius);
+        if (nearest_bound >= distance) { break; }
+
+        // Child bounding spheres are disjoint. Keep a lower bound for the
+        // skipped copies, so ray marching cannot step through one of them.
+        let runner_up = select(max(first, min(projection.z, projection.w)),
+            max(second, min(projection.x, projection.y)), first >= second) * unit;
+        let runner_up_length = sqrt(max(0.0, dot(point, point) + spread * (spread - 2.0 * runner_up)));
+        distance = min(distance, scale * (runner_up_length - child_radius));
+
+        // Apply the inverse similarity transform of the nearest child.
+        point = (cosine * from_tip + twist * cross(axis, from_tip)
+            + (1.0 - cosine) * dot(axis, from_tip) * axis) / shrink;
+        scale *= shrink;
+        twist = -twist;
+    }
+    return distance;
+}
 
 // Pseudo-Kleinian by Knighty and Theli-at.
 // Box fold and sphere inversion adapted from Mandelbulber v2's
@@ -234,12 +318,13 @@ fn base_orbit_distance(p: vec3<f32>, iterations: i32) -> f32 {
 // Compute the adaptive level independently so a normal can use one consistent
 // level for all of its neighbouring samples.
 fn detail_level(p: vec3<f32>, iterations: f32) -> f32 {
-    if (camera.mutation_stack.y == 0.0 && camera.parameters.y == MENGER) { return 1.0; }
+    if (camera.mutation_stack.y == 0.0 && (camera.parameters.y == MENGER || camera.parameters.y == SIERPINSKI
+        || camera.parameters.y == FOUR_BRANCH)) { return 1.0; }
     let distance_to_camera = max(length(p - camera.position_aspect.xyz), 0.0001);
     let extra_detail = max(-log2(distance_to_camera) - 2.0, 0.0);
     // Reduced previews evaluate a single nearby orbit level per sample.
     // Still frames and export blend adjacent levels at the full detail range.
-    if (camera.preview.y > 0.0) {
+    if (camera.preview.y > 0.0 && camera.four_branch_twist.y == 0.0) {
         return iterations + round(min(extra_detail, 4.0));
     }
     return iterations + min(extra_detail, 11.0);
@@ -248,7 +333,8 @@ fn primary_distance_at_level(p: vec3<f32>, level: f32) -> f32 {
     if (camera.parameters.y == MENGER) {
         return menger_distance(p, camera.menger, camera.menger_rotation);
     }
-    let lower = i32(floor(level));
+    let depth_offset = select(camera.orbit_depth.x, camera.orbit_depth.y, camera.parameters.y == MANDELBOX);
+    let lower = i32(floor(level + depth_offset));
     let fraction = fract(level);
     let a = base_orbit_distance(p, lower);
     if (fraction < 0.0001) { return a; }
@@ -272,6 +358,8 @@ fn distance_at_level(p: vec3<f32>, level: f32) -> f32 {
         var formula = MANDELBULB;
         var settings = vec4<f32>(0.0);
         var rotation = camera.menger_rotation;
+        var depth_offset = 0;
+        var four_branch_sine = 0.0;
         if (i < folded_layers) {
             coefficient = primary_coefficient;
             formula = camera.parameters.y;
@@ -279,8 +367,15 @@ fn distance_at_level(p: vec3<f32>, level: f32) -> f32 {
                 settings = camera.kifs;
             } else if (formula == AMAZING_SURFACE) {
                 settings = camera.amazing_surface;
-            } else {
+                depth_offset = i32(camera.orbit_depth.z);
+            } else if (formula == PSEUDO_KLEINIAN) {
                 settings = camera.pseudo_kleinian;
+                depth_offset = i32(camera.orbit_depth.w);
+            } else if (formula == FOUR_BRANCH) {
+                settings = camera.four_branch;
+                four_branch_sine = camera.four_branch_twist.x;
+            } else {
+                settings = camera.sierpinski;
             }
         } else {
             let stage = camera.extra_mutations[i - folded_layers];
@@ -288,20 +383,26 @@ fn distance_at_level(p: vec3<f32>, level: f32) -> f32 {
             formula = stage.blend.y;
             settings = stage.settings;
             rotation = stage.rotation;
+            four_branch_sine = stage.rotation[0].x;
+            depth_offset = i32(stage.blend.z);
         }
         var distance = 0.0;
         if (formula == KIFS) {
             distance = kifs_distance(p, settings);
         } else if (formula == AMAZING_SURFACE) {
-            distance = amazing_surface_distance(p, iterations, settings);
+            distance = amazing_surface_distance(p, iterations + depth_offset, settings);
         } else if (formula == PSEUDO_KLEINIAN) {
-            distance = pseudo_kleinian_distance(p, iterations, settings);
+            distance = pseudo_kleinian_distance(p, iterations + depth_offset, settings);
+        } else if (formula == SIERPINSKI) {
+            distance = sierpinski_distance(p, u32(settings.x));
+        } else if (formula == FOUR_BRANCH) {
+            distance = four_branch_distance(p, settings, four_branch_sine);
         } else if (formula == MENGER) {
             distance = menger_distance(p, settings, rotation);
         } else if (formula == MANDELBOX) {
-            distance = box_distance(p, iterations, settings);
+            distance = box_distance(p, iterations + depth_offset, settings);
         } else {
-            distance = bulb_distance(p, iterations, settings);
+            distance = bulb_distance(p, iterations + depth_offset, settings);
         }
         result += coefficient * distance;
     }
@@ -323,20 +424,22 @@ fn adaptive_normal_step(travel: f32) -> f32 {
 }
 fn normal(p: vec3<f32>, e: f32, iterations: f32, fallback: vec3<f32>) -> vec3<f32> {
     let level = detail_level(p, iterations);
+    let step = max(e, 0.000001 * max(1.0, max(abs(p.x), max(abs(p.y), abs(p.z)))));
     var gradient = vec3<f32>(0.0);
     // A single call site avoids replicating the full distance pipeline per sample.
     for (var sample = 0u; sample < 6u; sample++) {
         let axis = sample / 2u;
         let side = select(1.0, -1.0, sample % 2u != 0u);
         var offset = vec3<f32>(0.0);
-        offset[axis] = side * e;
+        offset[axis] = side * step;
         gradient[axis] += side * distance_at_level(p + offset, level);
     }
     let magnitude2 = dot(gradient, gradient);
     if (!(magnitude2 > 1e-24) || magnitude2 > 1e30) { return fallback; }
     return gradient * inverseSqrt(magnitude2);
 }
-fn appearance(point: vec3<f32>, n: vec3<f32>, view_direction: vec3<f32>, iterations: f32, side: f32, camera_distance: f32, light_sample: vec2<f32>, material: PathMaterial) -> vec3<f32> {
+fn appearance(point: vec3<f32>, n: vec3<f32>, view_direction: vec3<f32>, iterations: f32, side: f32, camera_distance: f32,
+    light_sample: vec2<f32>, material: PathMaterial, ambient_radiance: vec3<f32>, direct_visibility: f32) -> vec3<f32> {
     let azimuth = camera.light_settings.x;
     let elevation = camera.light_settings.y;
     var light_direction = normalize(vec3<f32>(sin(azimuth) * cos(elevation), sin(elevation), cos(azimuth) * cos(elevation)));
@@ -350,24 +453,24 @@ fn appearance(point: vec3<f32>, n: vec3<f32>, view_direction: vec3<f32>, iterati
         light_direction = (1.0 - delta) * light_direction + radial * (cos(angle) * tangent + sin(angle) * bitangent);
     }
     let light_color = camera.light_color_metallic.rgb;
-    let environment = camera.environment_and_light_radius.rgb;
     var ndotl = max(dot(n, light_direction), 0.0);
     if (ndotl > 0.0 && camera.light_settings.z > 0.0 && camera.display.w > 0.5) {
         if (directional_shadow(point, n, light_direction, iterations, side, camera_distance)) {
             ndotl = 0.0;
         }
     }
-    let ambient = material.base * environment * coat_transmission(material.coat, dot(n, view_direction));
+    let ambient = material.base * ambient_radiance * coat_transmission(material.coat, dot(n, view_direction));
     if (ndotl <= 0.0 || camera.light_settings.z <= 0.0) { return ambient; }
     let direct = path_bsdf(material, n, view_direction, light_direction).value
         * light_color * (camera.light_settings.z * PATH_PI * ndotl);
-    return ambient + direct;
+    return ambient + direct * direct_visibility;
 }
 const BULB_INTERIOR_ITERATIONS: i32 = 12;
 
 fn inside_escape_fractal(p: vec3<f32>) -> bool {
+    let iterations = BULB_INTERIOR_ITERATIONS + i32(camera.orbit_depth.x);
     return camera.mutation_stack.y == 0.0 && camera.parameters.y == MANDELBULB
-        && bulb_escape(p, BULB_INTERIOR_ITERATIONS) == BULB_INTERIOR_ITERATIONS;
+        && bulb_escape(p, iterations) == iterations;
 }
 
 fn directional_shadow(point: vec3<f32>, n: vec3<f32>, direction: vec3<f32>, iterations: f32, side: f32, camera_distance: f32) -> bool {
@@ -377,7 +480,7 @@ fn directional_shadow(point: vec3<f32>, n: vec3<f32>, direction: vec3<f32>, iter
     let bias = 2.0 * tolerance;
     let origin = point + n * bias;
     var travel = bias;
-    let refined = camera.filtering.w > 0.5;
+    let refined = camera.filtering.w > 0.5 || camera.four_branch_twist.y > 0.0;
     if (side == 0.0) {
         // The Mandelbulb interior is traced with escape-time membership.
         let budget = select(64, 112, refined);
@@ -399,15 +502,22 @@ fn directional_shadow(point: vec3<f32>, n: vec3<f32>, direction: vec3<f32>, iter
     return false;
 }
 
-fn pixel_random(seed: u32) -> f32 {
+fn pixel_hash(seed: u32) -> u32 {
     var bits = seed;
     bits = (bits ^ (bits >> 16u)) * 0x7feb352du;
     bits = (bits ^ (bits >> 15u)) * 0x846ca68bu;
-    return f32((bits ^ (bits >> 16u)) >> 8u) / 16777216.0;
+    return bits ^ (bits >> 16u);
+}
+
+fn pixel_random(seed: u32) -> f32 {
+    return f32(pixel_hash(seed) >> 8u) / 16777216.0;
 }
 
 fn ao_ray_sample(pixel: vec2<u32>, index: f32) -> vec2<f32> {
-    if (camera.appearance.y <= 0.5 || camera.appearance.z <= 0.0) { return vec2<f32>(-1.0); }
+    let ambient_panorama = camera.path_settings.x < 0.5 && u32(camera.path_settings.y) == 10u;
+    if (!ambient_panorama && (camera.appearance.y <= 0.5 || camera.appearance.z <= 0.0)) {
+        return vec2<f32>(-1.0);
+    }
     return pixel_sample(pixel, index, 0u);
 }
 
@@ -422,16 +532,17 @@ fn pixel_sample(pixel: vec2<u32>, index: f32, seed_offset: u32) -> vec2<f32> {
     return fract(scramble + index * vec2<f32>(0.754877666, 0.569840296));
 }
 
-fn ray_traced_occlusion(point: vec3<f32>, n: vec3<f32>, iterations: f32, side: f32, camera_distance: f32, sample: vec2<f32>) -> f32 {
-    let radius = camera.appearance.w;
-    if (sample.x < 0.0 || radius <= 0.0) { return 1.0; }
-
+fn ambient_ray(n: vec3<f32>, sample: vec2<f32>) -> vec3<f32> {
     let reference = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(n.z) > 0.95);
     let tangent = normalize(cross(reference, n));
     let bitangent = cross(n, tangent);
     let angle = sample.y * 6.2831853;
     let radial = sqrt(sample.x);
-    let ray = radial * (tangent * cos(angle) + bitangent * sin(angle)) + n * sqrt(1.0 - sample.x);
+    return radial * (tangent * cos(angle) + bitangent * sin(angle)) + n * sqrt(1.0 - sample.x);
+}
+
+fn ray_traced_occlusion(point: vec3<f32>, n: vec3<f32>, iterations: f32, side: f32, camera_distance: f32, ray: vec3<f32>) -> f32 {
+    let radius = camera.appearance.w;
     let hit_tolerance = max(0.00008, camera_distance * 0.00008) * distance_factor(camera_distance)
         / clamp(camera.display.z, 0.5, 8.0);
     let bias = min(2.0 * hit_tolerance, radius * 0.125);
@@ -475,24 +586,64 @@ fn fogged(color: vec3<f32>, distance: f32) -> vec4<f32> {
 struct SurfaceGuide {
     albedo: vec3<f32>,
     normal: vec3<f32>,
+    valid: f32,
+    depth: f32,
 }
 
 fn shade_surface(point: vec3<f32>, n: vec3<f32>, view: vec3<f32>, iterations: f32, side: f32, travel: f32,
     world_to_view: mat3x3<f32>, occlusion_sample: vec2<f32>, light_sample: vec2<f32>, path_seed: u32,
     guide: ptr<function, SurfaceGuide>) -> vec4<f32> {
     let material = surface_material(surface_base_color(n, world_to_view));
-    *guide = SurfaceGuide(material.base, n);
+    (*guide).albedo = material.base;
+    (*guide).normal = n;
+    (*guide).depth = travel;
     var color: vec3<f32>;
     if (camera.path_settings.x > 0.5) {
         color = trace_light_path(point, n, view, side, travel, path_seed, material, world_to_view);
     } else {
-        color = appearance(point, n, view, iterations, side, travel, light_sample, material)
-            * ray_traced_occlusion(point, n, iterations, side, travel, occlusion_sample) + material_emission(n, view);
+        let use_panorama = u32(camera.path_settings.y) == 10u;
+        var ambient_radiance = camera.environment_and_light_radius.rgb;
+        var visibility = 1.0;
+        if (occlusion_sample.x >= 0.0) {
+            var ray = ambient_ray(n, occlusion_sample);
+            var weight = 1.0;
+            if (use_panorama) {
+                let dims = textureDimensions(panorama_importance);
+                if (dims.x > 1u) {
+                    var seed = path_seed ^ 0x82e9b139u;
+                    var light_pdf = 0.0;
+                    if (path_random(&seed) < 0.5) {
+                        let light = sample_panorama(dims, &seed);
+                        ray = light.ray;
+                        light_pdf = light.pdf;
+                    } else {
+                        light_pdf = panorama_pdf(ray, dims);
+                    }
+                    let cosine_pdf = max(dot(n, ray), 0.0) / PATH_PI;
+                    // One draw from the mixture, with one visibility ray at most.
+                    weight = cosine_pdf / (0.5 * (cosine_pdf + light_pdf));
+                }
+            }
+            if (weight > 0.0 && camera.appearance.y > 0.5 && camera.appearance.z > 0.0 && camera.appearance.w > 0.0) {
+                visibility = ray_traced_occlusion(point, n, iterations, side, travel, ray);
+            }
+            if (use_panorama) {
+                ambient_radiance = vec3<f32>(0.0);
+                if (weight > 0.0) {
+                    ambient_radiance = world_radiance(ray) * weight;
+                }
+            }
+        }
+        let direct_visibility = select(visibility, 1.0, use_panorama);
+        color = appearance(point, n, view, iterations, side, travel, light_sample, material,
+            ambient_radiance * visibility, direct_visibility) + material_emission(n, view);
     }
     return fogged(color * exp2(camera.display.x), travel);
 }
 
 fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool, occlusion_sample: vec2<f32>, light_sample: vec2<f32>, path_seed: u32, guide: ptr<function, SurfaceGuide>) -> vec4<f32> {
+    (*guide).valid = 1.0;
+    (*guide).depth = -1.0;
     let background = select(camera.background_color.rgb, vec3<f32>(0.015, 0.02, 0.04), camera.parameters.w > 0.5);
     if (camera.orientation.z > 0.5) {
         let p = vec3<f32>(uv.x * camera.position_aspect.w * 1.6, uv.y * 1.6, camera.orientation.w);
@@ -520,15 +671,16 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool, occlusion_samp
     let primary_ray = forward * focal_scale() + right * uv.x * camera.position_aspect.w + up * uv.y;
     let lens_shift = right * lens_offset.x + up * lens_offset.y;
     let origin = camera.position_aspect.xyz + lens_shift;
-    var ray = normalize(primary_ray);
+    var direction = primary_ray;
     if (dot(lens_offset, lens_offset) > 0.0) {
-        ray = normalize(primary_ray * (camera.lens.y / focal_scale()) - lens_shift);
+        direction = primary_ray * (camera.lens.y / focal_scale()) - lens_shift;
     }
+    let ray = normalize(direction);
     var travel = 0.0;
     var hit = false;
     let quality = clamp(camera.display.z, 0.5, 8.0);
     if (inside_escape_fractal(origin)) {
-        let refined = focus_only || camera.filtering.w > 0.5;
+        let refined = focus_only || camera.filtering.w > 0.5 || camera.four_branch_twist.y > 0.0;
         let scan_budget = select(64, 112, refined);
         let min_step = select(0.0015, 0.00065, refined) / sqrt(quality);
         let max_step = select(0.16, 0.07, refined);
@@ -543,6 +695,7 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool, occlusion_samp
             if (travel >= 5.12) { break; }
         }
         if (!hit) {
+            (*guide).valid = select(0.0, 1.0, travel >= 5.12);
             if (camera.parameters.w > 0.5) { return vec4<f32>(1.0, 0.1, 0.05, 1.0); }
             if (focus_only) { return vec4<f32>(0.0); }
             return fogged(camera_background(background, ray), 5.12);
@@ -568,14 +721,15 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool, occlusion_samp
     var approximate_hit = false;
     var extended_hit = false;
     // March to the next boundary when starting inside a signed field.
-    let signed_field = camera.mutation_stack.y > 0.0 || camera.parameters.y == MENGER || camera.parameters.y == KIFS || camera.parameters.y == PSEUDO_KLEINIAN;
+    let signed_field = camera.mutation_stack.y > 0.0 || camera.parameters.y == MENGER || camera.parameters.y == KIFS
+        || camera.parameters.y == PSEUDO_KLEINIAN || camera.parameters.y == SIERPINSKI || camera.parameters.y == FOUR_BRANCH;
     let inside_field = signed_field && distance_estimate(origin, iterations) < 0.0;
     let side = select(1.0, -1.0, inside_field);
     // Only rays which have not converged continue beyond the regular budget.
     // The extra work is limited to still-frame rendering and export.
     // A mixed signed field can need more steps to resolve narrow surfaces.
     let preview_budget = select(512, 256, camera.preview.y > 0.0);
-    let step_budget = select(preview_budget, 3072, camera.filtering.w > 0.5);
+    let step_budget = select(preview_budget, 3072, camera.filtering.w > 0.5 || camera.four_branch_twist.y > 0.0);
     for (var i = 0; i < step_budget; i++) {
         let d = side * distance_estimate(origin + ray * travel, iterations);
         let local_quality = quality / distance_factor(travel);
@@ -599,6 +753,7 @@ fn trace(uv: vec2<f32>, lens_offset: vec2<f32>, focus_only: bool, occlusion_samp
         hit = true;
         approximate_hit = true;
     }
+    (*guide).valid = select(1.0, 0.0, exhausted);
     if (!hit) {
         if (focus_only) { return vec4<f32>(0.0); }
         if (camera.parameters.w > 0.5 && exhausted) {
@@ -626,11 +781,25 @@ fn viewport_uv(uv: vec2<f32>) -> vec2<f32> {
     return (uv - camera.viewport.xy) * scale;
 }
 
-fn sample_lens(index: f32) -> vec2<f32> {
-    if (camera.lens.z <= 0.0 || index == 0.0) { return vec2<f32>(0.0); }
-    let sample = fract(vec2<f32>(0.5) + index * vec2<f32>(0.43857902, 0.3281734));
+fn sample_lens(pixel: vec2<u32>, index: f32) -> vec2<f32> {
+    if (camera.lens.z <= 0.0 || camera.parameters.w > 0.5) { return vec2<f32>(0.0); }
+    // Give nearby pixels different starting points on the aperture, while
+    // keeping the pattern stable between passes and across export tiles.
+    let seed = pixel.x + 13763u * pixel.y;
+    let shift = vec2<f32>(pixel_random(seed + 44293u), pixel_random(seed + 94273u));
+    let sample = fract(shift + index * vec2<f32>(0.43857902, 0.3281734));
+    let blades = camera.noise_sampling.y;
+    let radius = sqrt(sample.x) * camera.lens.z;
+    if (blades >= 3.0) {
+        // Each blade spans an equal-area triangle with the center of the lens.
+        let sector = sample.y * blades;
+        let angle_step = 6.2831853 / blades;
+        let start = floor(sector) * angle_step + camera.noise_sampling.z;
+        let end = start + angle_step;
+        return radius * mix(vec2<f32>(cos(start), sin(start)), vec2<f32>(cos(end), sin(end)), fract(sector));
+    }
     let angle = 6.2831853 * sample.y;
-    return vec2<f32>(cos(angle), sin(angle)) * (sqrt(sample.x) * camera.lens.z);
+    return vec2<f32>(cos(angle), sin(angle)) * radius;
 }
 
 @fragment fn fs_focus() -> @location(0) f32 {
@@ -640,29 +809,39 @@ fn sample_lens(index: f32) -> vec2<f32> {
 
 @fragment fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var guide: SurfaceGuide;
-    return apply_contrast(viewport_samples(in, 0.0, false, &guide), camera.viewport.w);
+    let color = viewport_samples(in, 0.0, false, &guide);
+    return apply_contrast(vec4<f32>(color.rgb, 1.0), camera.viewport.w);
 }
 
 fn viewport_samples(in: VertexOut, first_index: f32, progressive: bool, guide_out: ptr<function, SurfaceGuide>) -> vec4<f32> {
-    let height = max(camera.parameters.z * max(camera.viewport.z, 1.0), 1.0);
+    let count = u32(clamp(camera.path_display.z, 1.0, 4.0));
+    return viewport_sample_range(in, first_index, count, progressive, guide_out);
+}
+
+fn viewport_sample_range(in: VertexOut, first_index: f32, count: u32, progressive: bool, guide_out: ptr<function, SurfaceGuide>) -> vec4<f32> {
+    let preview_scale = select(1.0, camera.preview.z / max(camera.four_branch_twist.y, 1.0), camera.four_branch_twist.y > 0.0);
+    let height = max(camera.parameters.z * max(camera.viewport.z, 1.0) * preview_scale, 1.0);
     let pixel = vec2<f32>(2.0 / (height * camera.position_aspect.w), 2.0 / height);
     let position = vec2<u32>(in.position.xy);
-    let count = u32(clamp(camera.path_display.z, 1.0, 4.0));
     var color = vec4<f32>(0.0);
     for (var sample = 0u; sample < count; sample++) {
         var guide: SurfaceGuide;
         let index = first_index + f32(sample);
-        let offset = fract(vec2<f32>(0.5) + index * vec2<f32>(0.754877666, 0.569840296)) - vec2<f32>(0.5);
+        let offset = primary_offset(position, index, camera.four_branch_twist.w);
         var ao_sample = vec2<f32>(-1.0);
         var light_sample = vec2<f32>(-1.0);
         if (progressive || count > 1u) {
             ao_sample = ao_ray_sample(position, index);
             light_sample = light_ray_sample(position, index);
+        } else if (camera.path_settings.x < 0.5 && u32(camera.path_settings.y) == 10u) {
+            ao_sample = ao_ray_sample(position, index);
         }
-        color += trace(viewport_uv(in.uv + pixel * offset), sample_lens(index), false,
+        let sample_color = trace(viewport_uv(in.uv + pixel * offset), sample_lens(position, index), false,
             ao_sample, light_sample, path_pixel_seed(position, index), &guide);
+        color += vec4<f32>(sample_color.rgb, guide.valid);
         (*guide_out).albedo += guide.albedo / f32(count);
         (*guide_out).normal += guide.normal / f32(count);
+        (*guide_out).depth = guide.depth;
     }
     return color / f32(count);
 }
@@ -681,10 +860,10 @@ fn export_sample(in: VertexOut, guide: ptr<function, SurfaceGuide>) -> vec4<f32>
     let uv = vec2<f32>(2.0 * pixel_position.x / full_size.x - 1.0,
                        1.0 - 2.0 * pixel_position.y / full_size.y);
     let index = camera.filtering.z;
-    let offset = fract(vec2<f32>(0.5) + index * vec2<f32>(0.754877666, 0.569840296)) - vec2<f32>(0.5);
-    let jitter = vec2<f32>(2.0 * offset.x / full_size.x, 2.0 * offset.y / full_size.y);
     let position = vec2<u32>(pixel_position);
-    return trace(uv + jitter, sample_lens(index), false, ao_ray_sample(position, index), light_ray_sample(position, index), path_pixel_seed(position, index), guide);
+    let offset = primary_offset(position, index, 0.0);
+    let jitter = vec2<f32>(2.0 * offset.x / full_size.x, 2.0 * offset.y / full_size.y);
+    return trace(uv + jitter, sample_lens(position, index), false, ao_ray_sample(position, index), light_ray_sample(position, index), path_pixel_seed(position, index), guide);
 }
 
 @fragment fn fs_export(in: VertexOut) -> @location(0) vec4<f32> {

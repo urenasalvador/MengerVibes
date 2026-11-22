@@ -95,8 +95,9 @@ impl Frame {
         self.into_png(contrast)
     }
 
-    pub fn finish_viewport(mut self, backend: Backend, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
+    pub fn finish_viewport(mut self, backend: Backend, cancel: &AtomicBool) -> Result<(Vec<u8>, std::time::Instant), String> {
         Runtime::load(backend)?.filter(&mut self, cancel)?;
+        let filtered_at = std::time::Instant::now();
         let [color, _, _] = self.planes;
         let mut packed = Vec::new();
         packed.try_reserve_exact(color.len() * 8).map_err(|_| "Not enough memory for the denoised viewport".to_string())?;
@@ -105,7 +106,7 @@ impl Frame {
                 packed.extend(half::f16::from_f32(value.clamp(0.0, 65504.0)).to_le_bytes());
             }
         }
-        Ok(packed)
+        Ok((packed, filtered_at))
     }
 
     pub(super) fn into_png(self, contrast: f32) -> Result<image::RgbaImage, String> {
